@@ -3,6 +3,8 @@
 #  Rathole Reverse Tunnel Manager (IRAN <-> KHAREJ)
 #  Reverse architecture: Iran server = rathole server | Kharej (abroad) server = rathole client
 #  Tunnel port: 8085 | Fixed token | Auto watchdog | Up to 3 Iran servers
+#  Stability patch: unlimited auto-restart, tolerant heartbeat, faster watchdog,
+#                    kernel keepalive/idle tuning applied automatically at install.
 # =============================================================================
 
 # ---------- Fixed settings ----------
@@ -161,6 +163,8 @@ choose_proto() {
 }
 
 # ---------- Generate transport block for server ----------
+# NOTE (stability patch): keepalive_secs/keepalive_interval tightened (10/3)
+# so a dead peer is detected and NAT mappings on Iranian ISPs stay refreshed.
 transport_server_block() {
   case "$PROTO" in
     tcp)
@@ -170,8 +174,8 @@ type = "tcp"
 
 [server.transport.tcp]
 nodelay = true
-keepalive_secs = 20
-keepalive_interval = 8
+keepalive_secs = 10
+keepalive_interval = 3
 EOF
       ;;
     websocket)
@@ -206,8 +210,8 @@ type = "tcp"
 
 [client.transport.tcp]
 nodelay = true
-keepalive_secs = 20
-keepalive_interval = 8
+keepalive_secs = 10
+keepalive_interval = 3
 EOF
       ;;
     websocket)
@@ -233,6 +237,10 @@ EOF
 }
 
 # ---------- Create systemd service ----------
+# NOTE (stability patch): StartLimitIntervalSec=0 removes systemd's default
+# "5 restarts / 10s then give up" rule. Without this, a burst of rapid drops
+# (common on filtered Iranian links) trips the limit and the unit goes to a
+# permanently 'failed' state until someone restarts it by hand.
 make_unit() {
   local name="$1" conf="$2" desc="$3"
   cat > "/etc/systemd/system/${name}.service" <<EOF
@@ -240,12 +248,13 @@ make_unit() {
 Description=${desc}
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 ExecStart=${BIN} ${conf}
 Restart=always
-RestartSec=3
+RestartSec=2
 LimitNOFILE=1048576
 Nice=-10
 
@@ -270,6 +279,32 @@ open_ports() {
     firewall-cmd --reload >/dev/null 2>&1
     ok "Ports opened in firewalld."
   fi
+}
+
+# =============================================================================
+#  Stability tuning (kernel + BBR) — silent version, called automatically
+#  from setup_iran / setup_kharej so every fresh install gets it.
+# =============================================================================
+apply_net_tuning() {
+  cat > /etc/sysctl.d/99-rathole-tune.conf <<'EOF'
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.core.rmem_max = 67108864
+net.core.wmem_max = 67108864
+net.ipv4.tcp_rmem = 4096 87380 67108864
+net.ipv4.tcp_wmem = 4096 87380 67108864
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_keepalive_time = 30
+net.ipv4.tcp_keepalive_intvl = 5
+net.ipv4.tcp_keepalive_probes = 5
+net.core.netdev_max_backlog = 250000
+net.ipv4.tcp_no_metrics_save = 1
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_syn_retries = 3
+net.ipv4.tcp_retries2 = 8
+EOF
+  sysctl --system >/dev/null 2>&1
 }
 
 # =============================================================================
@@ -317,13 +352,15 @@ setup_iran() {
   fi
 
   # --- Build server.toml ---
+  # NOTE (stability patch): heartbeat_interval lowered 30 -> 15s so pings go
+  # out more often, keeping NAT/firewall session state alive on both sides.
   local conf="$CONF_DIR/iran-server.toml"
   [ -f "$conf" ] && cp -f "$conf" "${conf}.bak.$(date +%s)"
   {
     echo "[server]"
     echo "bind_addr = \"0.0.0.0:${TUNNEL_PORT}\""
     echo "default_token = \"${TOKEN}\""
-    echo "heartbeat_interval = 30"
+    echo "heartbeat_interval = 15"
     echo ""
     transport_server_block
     echo ""
@@ -341,6 +378,10 @@ setup_iran() {
 
   # --- Watchdog ---
   install_watchdog
+
+  # --- Kernel/network stability tuning (automatic) ---
+  apply_net_tuning
+  ok "Kernel network tuning applied (BBR + keepalive + idle-recovery)."
 
   # --- Firewall ---
   open_ports "$ports"
@@ -426,6 +467,9 @@ setup_kharej() {
     dest="${dest:-127.0.0.1}"
 
     # --- Build client.toml ---
+    # NOTE (stability patch): heartbeat_timeout raised 40 -> 90s so normal
+    # network jitter doesn't get misread as a dead server and trigger a
+    # reconnect storm. retry_interval stays at 1s for a fast real reconnect.
     local conf="$CONF_DIR/kharej-client-${i}.toml"
     [ -f "$conf" ] && cp -f "$conf" "${conf}.bak.$(date +%s)"
     {
@@ -433,7 +477,7 @@ setup_kharej() {
       echo "remote_addr = \"${ip}:${TUNNEL_PORT}\""
       echo "default_token = \"${TOKEN}\""
       echo "retry_interval = 1"
-      echo "heartbeat_timeout = 40"
+      echo "heartbeat_timeout = 90"
       echo ""
       transport_client_block
       echo ""
@@ -451,6 +495,10 @@ setup_kharej() {
 
   # --- Watchdog ---
   install_watchdog
+
+  # --- Kernel/network stability tuning (automatic) ---
+  apply_net_tuning
+  ok "Kernel network tuning applied (BBR + keepalive + idle-recovery)."
 
   echo "kharej" > "$ROLE_FILE"
   {
@@ -483,8 +531,13 @@ setup_kharej() {
 }
 
 # =============================================================================
-#  Automatic watchdog (every 1 minute - on both servers)
+#  Automatic watchdog (every 30 seconds - on both servers)
 # =============================================================================
+# NOTE (stability patch): watchdog now runs twice a minute (via two cron
+# lines, one offset by sleep 30) instead of once, and calls
+# 'systemctl reset-failed' before every restart so a unit that previously
+# hit systemd's restart-rate limit and got stuck in 'failed' is guaranteed
+# to be recovered instead of sitting dead until a human restarts it.
 install_watchdog() {
   cat > "$WATCHDOG" <<'WDEOF'
 #!/bin/bash
@@ -497,6 +550,7 @@ for unit in $(systemctl list-unit-files 2>/dev/null | grep -E '^rathole-(iran|kh
   systemctl is-enabled --quiet "$unit" 2>/dev/null || continue
   if ! systemctl is-active --quiet "$unit"; then
     echo "$TS $unit was stopped; restarted" >> "$LOG"
+    systemctl reset-failed "$unit" 2>/dev/null
     systemctl restart "$unit"
   fi
 done
@@ -510,6 +564,7 @@ for f in /etc/rathole/kharej-client-*.toml; do
   [ -z "$ip" ] && continue
   if ! ss -tn state established 2>/dev/null | grep -q "${ip}:${pt}"; then
     echo "$TS Connection to ${ip}:${pt} was down; restarting rathole-kharej-${n}" >> "$LOG"
+    systemctl reset-failed "rathole-kharej-${n}.service" 2>/dev/null
     systemctl restart "rathole-kharej-${n}.service"
   fi
 done
@@ -520,11 +575,14 @@ if [ -f "$LOG" ] && [ "$(wc -l < "$LOG")" -gt 1000 ]; then
 fi
 WDEOF
   chmod +x "$WATCHDOG"
-  echo "* * * * * root ${WATCHDOG} >/dev/null 2>&1" > "$CRON_FILE"
+  {
+    echo "* * * * * root ${WATCHDOG} >/dev/null 2>&1"
+    echo "* * * * * root sleep 30 && ${WATCHDOG} >/dev/null 2>&1"
+  } > "$CRON_FILE"
   chmod 644 "$CRON_FILE"
   systemctl restart cron  >/dev/null 2>&1
   systemctl restart crond >/dev/null 2>&1
-  ok "Watchdog installed (automatic check every 1 minute)."
+  ok "Watchdog installed (automatic check every 30 seconds, self-heals failed units)."
 }
 
 # =============================================================================
@@ -567,6 +625,7 @@ restart_all() {
   local u found=0
   for u in $(systemctl list-unit-files 2>/dev/null | grep -E '^rathole-(iran|kharej)' | awk '{print $1}'); do
     found=1
+    systemctl reset-failed "$u" 2>/dev/null
     systemctl restart "$u" && ok "$u restarted."
   done
   [ "$found" = "0" ] && warn "No service found."
@@ -575,27 +634,12 @@ restart_all() {
 }
 
 # =============================================================================
-#  Network optimization (BBR + sysctl)
+#  Network optimization (BBR + sysctl) — manual menu entry point
 # =============================================================================
 optimize_net() {
   banner
   info "Applying BBR and network optimization ..."
-  cat > /etc/sysctl.d/99-rathole-tune.conf <<'EOF'
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-net.core.rmem_max = 67108864
-net.core.wmem_max = 67108864
-net.ipv4.tcp_rmem = 4096 87380 67108864
-net.ipv4.tcp_wmem = 4096 87380 67108864
-net.ipv4.tcp_fastopen = 3
-net.ipv4.tcp_keepalive_time = 60
-net.ipv4.tcp_keepalive_intvl = 10
-net.ipv4.tcp_keepalive_probes = 6
-net.core.netdev_max_backlog = 250000
-net.ipv4.tcp_no_metrics_save = 1
-net.ipv4.tcp_mtu_probing = 1
-EOF
-  sysctl --system >/dev/null 2>&1
+  apply_net_tuning
   if sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q bbr; then
     ok "BBR enabled."
   else
@@ -626,7 +670,7 @@ edit_ports() {
       echo "[server]"
       echo "bind_addr = \"0.0.0.0:${TUNNEL_PORT}\""
       echo "default_token = \"${TOKEN}\""
-      echo "heartbeat_interval = 30"
+      echo "heartbeat_interval = 15"
       echo ""
       grep -A6 '^\[server.transport\]' "${conf}.bak."* 2>/dev/null | head -n 20 | sed '/^--$/d' || transport_server_block
       echo ""

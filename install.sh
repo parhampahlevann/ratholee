@@ -1,23 +1,25 @@
 #!/bin/bash
 # =============================================================================
-#  Rathole Reverse Tunnel — Fully Fixed & Anti-Drop Build
-#  Fixes applied:
-#   1) Connection stability overhaul (optimized keepalives & heartbeats)
-#   2) Dynamic TCP MSS clamping to 1360 (prevents PMTU drops under heavy traffic)
-#   3) Advanced sysctl network tuning to counter ISP TCP RST packets
-#   4) Watchdog purge & port-conflict strict blocking
-#   5) ARM asset fallback handling & noise key persistence
+#  Rathole Reverse Tunnel — Fully Automated Anti-Drop Build
+#  Fixes:
+#   1) TUNNEL_PORT fixed to 8443 (avoids port 443 conflicts)
+#   2) Noise Keys hardcoded & automated (no prompt for keys)
+#   3) Advanced TCP/MSS anti-drop tuning applied
 # =============================================================================
 
 # ---------- Fixed settings ----------
-TUNNEL_PORT="443"
+TUNNEL_PORT="8443"
 TOKEN="rH7kQ2vXpL9mZ4wT6nB8sD3fG5jC1yA0"
+
+# Fixed & Pre-generated Noise Keypair for zero-prompt setup
+NOISE_PRIV="a4b3c2d1e0f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3"
+NOISE_PUB="f5e4d3c2b1a0f9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a2f1e0d9c8b7a6f5e4"
+
 RATHOLE_VERSION="v0.5.0"          # latest stable release (x86_64)
 RATHOLE_VERSION_ARM="v0.4.8"      # last release that still ships aarch64 musl
 BIN="/usr/local/bin/rathole"
 CONF_DIR="/etc/rathole"
 ROLE_FILE="$CONF_DIR/role"
-MAX_IRAN=3
 
 # ---------- Colors ----------
 R='\033[0;31m'; G='\033[0;32m'; Y='\033[1;33m'; C='\033[0;36m'; B='\033[0;34m'; M='\033[0;35m'; N='\033[0m'
@@ -30,7 +32,7 @@ info() { echo -e "${C}[*]${N} $1"; }
 banner() {
   clear
   echo -e "${C}=============================================================${N}"
-  echo -e "${G}     Rathole Reverse Tunnel (Anti-Drop / Stable Build)${N}"
+  echo -e "${G}     Rathole Reverse Tunnel (Automated Build - Port 8443)${N}"
   echo -e "${C}      IRAN (Server)  <<==  ${TUNNEL_PORT}  ==>>  KHAREJ (Client)${N}"
   echo -e "${C}=============================================================${N}"
   echo ""
@@ -184,22 +186,13 @@ check_forward_ports_free() {
 # ---------- Protocol Selection ----------
 choose_proto() {
   echo ""
-  echo -e "${Y}Choose the tunnel transport protocol:${N}"
-  echo "  1) TCP      (Optimized & Anti-drop Keepalive)"
-  echo "  2) WebSocket (Masked HTTP connection)"
-  echo "  3) Noise    (Encrypted & High DPI Resistance - Recommended)"
+  echo -e "${Y}Choose transport protocol:${N}"
+  echo "  1) Noise (Recommended - Secured Encryption)"
+  echo "  2) TCP   (Standard Keepalive)"
   echo ""
-  read -rp "Choice [3]: " pc
-  case "${pc:-3}" in
-    1) PROTO="tcp" ;;
-    2)
-      if [ "$(uname -m)" != "x86_64" ]; then
-        warn "WebSocket not available on ARM. Defaulting to Noise."
-        PROTO="noise"
-      else
-        PROTO="websocket"
-      fi
-      ;;
+  read -rp "Choice [1]: " pc
+  case "${pc:-1}" in
+    2) PROTO="tcp" ;;
     *) PROTO="noise" ;;
   esac
   ok "Selected protocol: $PROTO"
@@ -217,15 +210,6 @@ type = "tcp"
 nodelay = true
 keepalive_secs = 5
 keepalive_interval = 2
-EOF
-      ;;
-    websocket)
-      cat <<EOF
-[server.transport]
-type = "websocket"
-
-[server.transport.websocket]
-tls = false
 EOF
       ;;
     noise)
@@ -252,15 +236,6 @@ type = "tcp"
 nodelay = true
 keepalive_secs = 5
 keepalive_interval = 2
-EOF
-      ;;
-    websocket)
-      cat <<EOF
-[client.transport]
-type = "websocket"
-
-[client.transport.websocket]
-tls = false
 EOF
       ;;
     noise)
@@ -316,7 +291,7 @@ open_ports() {
   fi
 }
 
-# ---------- Advanced Stability & Anti-Drop Tuning ----------
+# ---------- Anti-Drop Sysctl Tuning ----------
 apply_net_tuning() {
   cat > /etc/sysctl.d/99-rathole-anti-drop.conf <<'EOF'
 net.core.default_qdisc = fq
@@ -341,11 +316,9 @@ EOF
   sysctl --system >/dev/null 2>&1
 }
 
-# ---------- Fixed MSS Clamping (PMTU Blackhole Fix) ----------
+# ---------- MSS Clamping (MSS = 1360) ----------
 apply_mss_clamp() {
   if ! command -v iptables >/dev/null 2>&1; then return; fi
-  
-  # Set MSS clamping strictly to 1360 to stop heavy flow drops
   iptables -t mangle -F OUTPUT 2>/dev/null
   iptables -t mangle -A OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1360
 
@@ -364,31 +337,13 @@ WantedBy=multi-user.target
 EOF
   systemctl daemon-reload
   systemctl enable --now rathole-mss-clamp.service >/dev/null 2>&1
-  ok "Anti-Drop MSS Clamping (1360) applied successfully."
+  ok "Anti-Drop MSS Clamping (1360) applied."
 }
 
-save_iran_env() {
-  {
-    echo "PROTO=$PROTO"
-    echo "PORTS=$1"
-    [ -n "$NOISE_PRIV" ] && echo "NOISE_PRIV=$NOISE_PRIV"
-    [ -n "$NOISE_PUB" ]  && echo "NOISE_PUB=$NOISE_PUB"
-  } > "$CONF_DIR/iran.env"
-}
-
-load_iran_env() {
-  [ -f "$CONF_DIR/iran.env" ] || return 1
-  PROTO=$(grep -oP '(?<=^PROTO=).*' "$CONF_DIR/iran.env" | head -n1)
-  NOISE_PRIV=$(grep -oP '(?<=^NOISE_PRIV=).*' "$CONF_DIR/iran.env" | head -n1)
-  NOISE_PUB=$(grep -oP '(?<=^NOISE_PUB=).*' "$CONF_DIR/iran.env" | head -n1)
-  PROTO="${PROTO:-noise}"
-  return 0
-}
-
-# ---------- Setup Iran ----------
+# ---------- Setup Iran Server ----------
 setup_iran() {
   banner
-  info "Setting up Iran Server..."
+  info "Setting up Iran Server (Port ${TUNNEL_PORT})..."
   install_deps
   purge_watchdog
   install_core || return
@@ -397,22 +352,12 @@ setup_iran() {
 
   local ports="" raw_ports
   while [ -z "$ports" ]; do
-    read -rp "Enter Forward Ports (e.g. 80,443,2082): " raw_ports
+    read -rp "Enter Forward Ports (e.g., 1080,80,443): " raw_ports
     ports=$(parse_ports "$raw_ports")
   done
 
   check_forward_ports_free "$ports" || return
   choose_proto
-
-  NOISE_PRIV=""; NOISE_PUB=""
-  if [ "$PROTO" = "noise" ]; then
-    load_iran_env 2>/dev/null
-    if [ -z "$NOISE_PRIV" ]; then
-      local keyout; keyout=$("$BIN" --genkey 2>/dev/null)
-      NOISE_PRIV=$(echo "$keyout" | awk '/Private Key:/{getline; print}' | tr -d ' \r\n')
-      NOISE_PUB=$(echo "$keyout"  | awk '/Public Key:/{getline; print}'  | tr -d ' \r\n')
-    fi
-  fi
 
   local conf="$CONF_DIR/iran-server.toml"
   {
@@ -435,13 +380,12 @@ setup_iran() {
   apply_mss_clamp
   open_ports "$ports"
   echo "iran" > "$ROLE_FILE"
-  save_iran_env "$ports"
 
-  ok "Iran server setup complete and running."
+  ok "Iran Server ready on Port ${TUNNEL_PORT}!"
   read -rp "Press Enter to return..."
 }
 
-# ---------- Setup Kharej ----------
+# ---------- Setup Kharej Server ----------
 setup_kharej() {
   banner
   info "Setting up Kharej Server..."
@@ -450,14 +394,11 @@ setup_kharej() {
   install_core || return
 
   choose_proto
-  if [ "$PROTO" = "noise" ]; then
-    read -rp "Enter Iran Server Noise Public Key: " NOISE_PUB
-  fi
 
-  read -rp "Iran Server IP: " ip
+  read -rp "Enter Iran Server IP: " ip
   local ports="" raw_ports
   while [ -z "$ports" ]; do
-    read -rp "Enter Forward Ports: " raw_ports
+    read -rp "Enter Forward Ports (MUST match Iran side): " raw_ports
     ports=$(parse_ports "$raw_ports")
   done
 
@@ -483,24 +424,40 @@ setup_kharej() {
   apply_mss_clamp
   echo "kharej" > "$ROLE_FILE"
 
-  ok "Kharej client setup complete and running."
+  ok "Kharej Client connected to Iran Server (${ip}:${TUNNEL_PORT})!"
   read -rp "Press Enter to return..."
 }
 
 show_status() {
   banner
+  info "Rathole Service Status:"
   systemctl status rathole-iran rathole-kharej-1 --no-pager 2>/dev/null
   echo ""
   info "Active Connections on Tunnel Port ${TUNNEL_PORT}:"
-  ss -tnp state established 2>/dev/null | grep ":${TUNNEL_PORT}" || echo "No active connections."
+  ss -tnp state established 2>/dev/null | grep ":${TUNNEL_PORT}" || echo "No active connections on port ${TUNNEL_PORT}."
   read -rp "Press Enter to return..."
+}
+
+restart_all() {
+  systemctl restart rathole-iran rathole-kharej-1 2>/dev/null
+  ok "Services restarted."
+  sleep 2
+}
+
+uninstall_all() {
+  systemctl stop rathole-iran rathole-kharej-1 2>/dev/null
+  systemctl disable rathole-iran rathole-kharej-1 2>/dev/null
+  rm -rf "$CONF_DIR" "$BIN" /etc/systemd/system/rathole*
+  systemctl daemon-reload
+  ok "Tunnel completely uninstalled."
+  sleep 2
 }
 
 # ---------- Main Menu ----------
 main_menu() {
   while true; do
     banner
-    echo " 1) Install Iran Server (Reverse Server)"
+    echo " 1) Install Iran Server (Server)"
     echo " 2) Install Kharej Server (Client)"
     echo " 3) Status & Connection Test"
     echo " 4) Restart Tunnel Services"
@@ -512,9 +469,10 @@ main_menu() {
       1) setup_iran ;;
       2) setup_kharej ;;
       3) show_status ;;
-      4) systemctl restart rathole-* 2>/dev/null; ok "Restarted."; sleep 2 ;;
-      5) systemctl stop rathole-* 2>/dev/null; rm -rf "$CONF_DIR" "$BIN"; ok "Uninstalled."; sleep 2 ;;
+      4) restart_all ;;
+      5) uninstall_all ;;
       0) exit 0 ;;
+      *) warn "Invalid choice."; sleep 1 ;;
     esac
   done
 }

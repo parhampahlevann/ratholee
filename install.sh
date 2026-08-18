@@ -1,31 +1,23 @@
 #!/bin/bash
 # =============================================================================
-#  Rathole Reverse Tunnel Manager (IRAN <-> KHAREJ)
-#  Reverse architecture: Iran server = rathole server | Kharej (abroad) server = rathole client
-#  Fixed tunnel port + fixed token (no copy/paste needed) | Up to 3 Iran servers
-#
-#  STABILITY PATCH v4:
-#   - Tunnel port fixed to 443. Data channels were being silently timed out
-#     (SYN dropped, not refused) on the old high port (e.g. 38409) while the
-#     very first control-channel connection went through fine — a classic
-#     signature of behavior-based active blocking targeting a specific
-#     IP:port pair after it's identified as tunnel-like traffic. Port 443
-#     is far less likely to be broadly blocked since it carries ordinary
-#     HTTPS traffic everywhere.
-#   - Fixed token & fixed tunnel port — no prompting, no copy/paste.
-#   - No watchdog (removed in v3): it was force-restarting healthy
-#     connections during brief, normal TCP reconnect windows.
-#     systemd's Restart=always + StartLimitIntervalSec=0 is sufficient.
-#   - Anti-bufferbloat kernel tuning (moderate buffers, small backlog).
-#   - Rathole binary pinned to v0.5.0 — this is in fact the latest official
-#     stable release upstream, not an older fallback.
-#   - MSS clamping kept (fixes PMTU-blackhole packet drops).
+#  Rathole Reverse Tunnel — fixed build
+#  Fixes vs previous version:
+#   1) Watchdog fully purged (legacy service/timer/cron removed on install & uninstall)
+#   2) Port-bind conflict now BLOCKS setup instead of crash-looping the tunnel
+#      (this was the main "disconnects after a few seconds" bug)
+#   3) aarch64: rathole dropped the musl ARM asset in v0.5.0 -> automatic
+#      fallback to v0.4.8 core with a clear warning (no websocket on ARM)
+#   4) edit_ports no longer mangles the transport block / loses the Noise key
+#   5) Noise keys are persisted and reused across re-runs
+#   6) Client heartbeat_timeout 90 -> 45 (dead tunnels detected 2x faster)
+#   7) make_unit resets failed state before start
 # =============================================================================
 
 # ---------- Fixed settings ----------
 TUNNEL_PORT="443"
 TOKEN="rH7kQ2vXpL9mZ4wT6nB8sD3fG5jC1yA0"
-RATHOLE_VERSION="v0.5.0"
+RATHOLE_VERSION="v0.5.0"          # latest stable release (x86_64)
+RATHOLE_VERSION_ARM="v0.4.8"      # last release that still ships aarch64 musl
 BIN="/usr/local/bin/rathole"
 CONF_DIR="/etc/rathole"
 ROLE_FILE="$CONF_DIR/role"
@@ -42,7 +34,7 @@ info() { echo -e "${C}[*]${N} $1"; }
 banner() {
   clear
   echo -e "${C}=============================================================${N}"
-  echo -e "${G}      Rathole Reverse Tunnel${N}"
+  echo -e "${G}      Rathole Reverse Tunnel (fixed build)${N}"
   echo -e "${C}      IRAN (Server)  <<==  ${TUNNEL_PORT}  ==>>  KHAREJ (Client)${N}"
   echo -e "${C}=============================================================${N}"
   echo ""
@@ -74,30 +66,71 @@ install_deps() {
   ok "Prerequisites are ready."
 }
 
+# =============================================================================
+#  Watchdog purge — removes every trace of the old watchdog approach.
+#  The tunnel self-heals via systemd (Restart=always + StartLimitIntervalSec=0),
+#  so any external watchdog/timer/cron is obsolete and can fight with systemd.
+# =============================================================================
+purge_watchdog() {
+  local removed=0 u
+  # systemd units from any previous version
+  for u in rathole-watchdog.service rathole-watchdog.timer watchdog.service watchdog.timer; do
+    if systemctl list-unit-files 2>/dev/null | grep -q "^${u}"; then
+      systemctl disable --now "$u" >/dev/null 2>&1
+      rm -f "/etc/systemd/system/${u}"
+      removed=1
+    fi
+  done
+  # watchdog scripts / cron entries from older installers
+  rm -f /usr/local/bin/rathole-watchdog.sh /usr/local/bin/watchdog.sh 2>/dev/null
+  if [ -f /etc/cron.d/rathole-watchdog ] || [ -f /etc/cron.d/rathole ]; then
+    rm -f /etc/cron.d/rathole-watchdog /etc/cron.d/rathole
+    removed=1
+  fi
+  # clean user/root crontab lines pointing at rathole watchdog
+  if crontab -l 2>/dev/null | grep -qi 'rathole.*watchdog\|watchdog.*rathole'; then
+    crontab -l 2>/dev/null | grep -vi 'rathole.*watchdog\|watchdog.*rathole' | crontab - 2>/dev/null
+    removed=1
+  fi
+  systemctl daemon-reload 2>/dev/null
+  [ "$removed" = "1" ] && ok "Legacy watchdog found and fully removed."
+  return 0
+}
+
 # ---------- Detect architecture ----------
 detect_asset() {
   case "$(uname -m)" in
-    x86_64|amd64)  ASSET="rathole-x86_64-unknown-linux-gnu.zip" ;;
-    aarch64|arm64) ASSET="rathole-aarch64-unknown-linux-musl.zip" ;;
+    x86_64|amd64)
+      ASSET="rathole-x86_64-unknown-linux-gnu.zip"
+      ASSET_VERSION="$RATHOLE_VERSION"
+      ;;
+    aarch64|arm64)
+      # rathole dropped the aarch64 musl asset in v0.5.0 — last ARM build is v0.4.8.
+      # NOTE: v0.4.8 has NO websocket transport (websocket was added in v0.5.0).
+      ASSET="rathole-aarch64-unknown-linux-musl.zip"
+      ASSET_VERSION="$RATHOLE_VERSION_ARM"
+      warn "ARM server detected: using rathole ${ASSET_VERSION} (last ARM build)."
+      warn "WebSocket transport is NOT available on ARM — use TCP or Noise."
+      ;;
     *) err "Architecture $(uname -m) is not supported."; return 1 ;;
   esac
   return 0
 }
 
-# ---------- Install/update rathole core (pinned to the latest stable release) ----------
+# ---------- Install/update rathole core ----------
 install_core() {
   if [ -x "$BIN" ] && [ "$1" != "force" ]; then
     ok "Rathole core is already installed: $($BIN --version 2>/dev/null | head -n1)"
     return 0
   fi
   detect_asset || return 1
-  info "Downloading rathole core (pinned stable release ${RATHOLE_VERSION}) ..."
+  info "Downloading rathole core (${ASSET_VERSION}) ..."
   local urls=(
-    "https://github.com/rathole-org/rathole/releases/download/${RATHOLE_VERSION}/${ASSET}"
-    "https://github.com/rapiz1/rathole/releases/download/${RATHOLE_VERSION}/${ASSET}"
-    "https://ghproxy.net/https://github.com/rathole-org/rathole/releases/download/${RATHOLE_VERSION}/${ASSET}"
-    "https://ghfast.top/https://github.com/rathole-org/rathole/releases/download/${RATHOLE_VERSION}/${ASSET}"
-    "https://mirror.ghproxy.com/https://github.com/rathole-org/rathole/releases/download/${RATHOLE_VERSION}/${ASSET}"
+    "https://github.com/rathole-org/rathole/releases/download/${ASSET_VERSION}/${ASSET}"
+    "https://github.com/rapiz1/rathole/releases/download/${ASSET_VERSION}/${ASSET}"
+    "https://ghproxy.net/https://github.com/rathole-org/rathole/releases/download/${ASSET_VERSION}/${ASSET}"
+    "https://ghfast.top/https://github.com/rathole-org/rathole/releases/download/${ASSET_VERSION}/${ASSET}"
+    "https://mirror.ghproxy.com/https://github.com/rathole-org/rathole/releases/download/${ASSET_VERSION}/${ASSET}"
   )
   local tmp; tmp=$(mktemp -d)
   local done_dl=0
@@ -125,7 +158,6 @@ install_core() {
 }
 
 # ---------- Normalize port input ----------
-# Output: list of valid, unique ports separated by spaces
 parse_ports() {
   local raw="$1"
   raw="${raw//،/,}"; raw="${raw// /,}"; raw="${raw//;/,}"
@@ -142,30 +174,64 @@ parse_ports() {
   echo "${out# }"
 }
 
-# ---------- Warn / block if the tunnel port itself is already taken ----------
-# Port 443 is commonly used by a web server (nginx/apache), which would
-# conflict directly with rathole trying to bind the same port.
+# ---------- Port check helpers ----------
+port_in_use() { ss -tln 2>/dev/null | grep -qE "[:.]${1}[[:space:]]"; }
+
 check_tunnel_port_free() {
-  if ss -tln 2>/dev/null | grep -q ":${TUNNEL_PORT} "; then
+  if port_in_use "$TUNNEL_PORT"; then
     warn "Port ${TUNNEL_PORT} is already in use on this server (likely a web server)."
     echo -e "${Y}rathole needs this port exclusively. Stop whatever is using it, e.g.:${N}"
     echo "    systemctl stop nginx    # or apache2, caddy, etc."
     read -rp "Press Enter once port ${TUNNEL_PORT} is free (or Ctrl+C to abort)..."
+    if port_in_use "$TUNNEL_PORT"; then
+      err "Port ${TUNNEL_PORT} is still in use. Aborting to avoid a crash-loop."
+      return 1
+    fi
   fi
+  return 0
+}
+
+# =============================================================================
+#  FIX #2 — hard block on forward-port conflicts (Iran side).
+#  Previously this only warned; rathole then failed to bind the busy port,
+#  the server process exited, systemd restarted it, and the tunnel appeared
+#  to "connect for a few seconds then disconnect" forever.
+# =============================================================================
+check_forward_ports_free() {
+  local ports="$1" bad="" p
+  for p in $ports; do
+    # ignore ports bound by our own rathole server from a previous run
+    if port_in_use "$p" && ! ss -tlnp 2>/dev/null | grep -E "[:.]${p}[[:space:]]" | grep -q rathole; then
+      bad="$bad $p"
+    fi
+  done
+  if [ -n "$bad" ]; then
+    err "These ports are already in use by another service:${bad}"
+    echo -e "${Y}If rathole binds a busy port, the server crashes and restarts in a loop${N}"
+    echo -e "${Y}(tunnel connects for a few seconds, then drops). Free them or pick others.${N}"
+    return 1
+  fi
+  return 0
 }
 
 # ---------- Choose protocol ----------
-# Output in global variable PROTO : tcp | websocket | noise
 choose_proto() {
   echo ""
   echo -e "${Y}Choose the tunnel transport protocol:${N}"
   echo "  1) TCP        (default and recommended - fast and stable)"
-  echo "  2) WebSocket  (better bypass of some filters)"
+  echo "  2) WebSocket  (better bypass of some filters; x86_64 only)"
   echo "  3) Noise      (TCP + strong encryption - requires a key)"
   echo ""
   read -rp "Choice [1]: " pc
   case "${pc:-1}" in
-    2) PROTO="websocket" ;;
+    2)
+      if [ "$(uname -m)" != "x86_64" ]; then
+        err "WebSocket is not available on ARM (rathole ${RATHOLE_VERSION_ARM} has no websocket transport). Falling back to TCP."
+        PROTO="tcp"
+      else
+        PROTO="websocket"
+      fi
+      ;;
     3) PROTO="noise" ;;
     *) PROTO="tcp" ;;
   esac
@@ -245,12 +311,13 @@ EOF
 }
 
 # ---------- Create systemd service ----------
-# StartLimitIntervalSec=0 removes systemd's default "5 restarts / 10s then
-# give up" rule, so a burst of rapid drops can never leave the unit stuck
-# in a permanently 'failed' state requiring a manual restart. This alone
-# (no external watchdog) is enough for self-healing.
+# StartLimitIntervalSec=0 removes systemd's "5 restarts / 10s then give up"
+# rule, so rapid drops can never leave the unit stuck in 'failed' state.
+# This (no external watchdog) is enough for self-healing.
 make_unit() {
   local name="$1" conf="$2" desc="$3"
+  systemctl stop "${name}.service" >/dev/null 2>&1
+  systemctl reset-failed "${name}.service" >/dev/null 2>&1
   cat > "/etc/systemd/system/${name}.service" <<EOF
 [Unit]
 Description=${desc}
@@ -291,7 +358,6 @@ open_ports() {
 
 # =============================================================================
 #  Stability tuning (kernel + BBR) — anti-bufferbloat version.
-#  Called automatically from setup_iran / setup_kharej.
 # =============================================================================
 apply_net_tuning() {
   cat > /etc/sysctl.d/99-rathole-tune.conf <<'EOF'
@@ -346,6 +412,25 @@ EOF
   ok "MSS clamp applied (survives reboot)."
 }
 
+# ---------- Persisted env helpers (FIX #5: keys survive re-runs) ----------
+save_iran_env() {
+  {
+    echo "PROTO=$PROTO"
+    echo "PORTS=$1"
+    [ -n "$NOISE_PRIV" ] && echo "NOISE_PRIV=$NOISE_PRIV"
+    [ -n "$NOISE_PUB" ]  && echo "NOISE_PUB=$NOISE_PUB"
+  } > "$CONF_DIR/iran.env"
+}
+
+load_iran_env() {
+  [ -f "$CONF_DIR/iran.env" ] || return 1
+  PROTO=$(grep -oP '(?<=^PROTO=).*' "$CONF_DIR/iran.env" | head -n1)
+  NOISE_PRIV=$(grep -oP '(?<=^NOISE_PRIV=).*' "$CONF_DIR/iran.env" | head -n1)
+  NOISE_PUB=$(grep -oP '(?<=^NOISE_PUB=).*' "$CONF_DIR/iran.env" | head -n1)
+  PROTO="${PROTO:-tcp}"
+  return 0
+}
+
 # =============================================================================
 #  Iran server setup (rathole SERVER - reverse side)
 # =============================================================================
@@ -354,16 +439,17 @@ setup_iran() {
   echo -e "${M}>>> Setting up the Iran server (Server - reverse side)${N}"
   echo ""
   install_deps
+  purge_watchdog
   install_core || { read -rp "Press Enter to go back..."; return; }
 
   # --- Make sure the tunnel port (443) isn't already taken ---
-  check_tunnel_port_free
+  check_tunnel_port_free || { read -rp "Press Enter to go back..."; return; }
 
   # --- Forward ports ---
   echo ""
   echo -e "${Y}Enter the ports you want to forward${N}"
   echo -e "${C}(comma-separated - example: 22,80,2086,2053)${N}"
-  local ports=""
+  local ports="" raw_ports
   while [ -z "$ports" ]; do
     read -rp "Ports: " raw_ports
     ports=$(parse_ports "$raw_ports")
@@ -371,25 +457,32 @@ setup_iran() {
   done
   ok "Forward ports: $(echo $ports | tr ' ' ',')"
 
-  # --- Port conflict warning ---
-  for p in $ports; do
-    if ss -tln 2>/dev/null | grep -q ":${p} "; then
-      warn "Port ${p} is currently in use on this server (e.g. by another service)."
-    fi
-  done
+  # --- FIX #2: block on busy ports instead of crash-looping the tunnel ---
+  if ! check_forward_ports_free "$ports"; then
+    read -rp "Press Enter to go back and free those ports first..."
+    return
+  fi
 
   # --- Protocol ---
   choose_proto
 
-  # --- Noise: key generation ---
+  # --- Noise: reuse existing key, otherwise generate once and persist ---
   NOISE_PRIV=""; NOISE_PUB=""
   if [ "$PROTO" = "noise" ]; then
-    info "Generating Noise key ..."
-    local keyout; keyout=$("$BIN" --genkey 2>/dev/null)
-    NOISE_PRIV=$(echo "$keyout" | awk '/Private Key:/{getline; print}' | tr -d ' \r\n')
-    NOISE_PUB=$(echo "$keyout"  | awk '/Public Key:/{getline; print}'  | tr -d ' \r\n')
-    if [ -z "$NOISE_PRIV" ] || [ -z "$NOISE_PUB" ]; then
-      err "Noise key generation failed."; read -rp "Press Enter to go back..."; return
+    local old_priv old_pub
+    old_priv=$(grep -oP '(?<=^NOISE_PRIV=).*' "$CONF_DIR/iran.env" 2>/dev/null | head -n1)
+    old_pub=$(grep -oP '(?<=^NOISE_PUB=).*'  "$CONF_DIR/iran.env" 2>/dev/null | head -n1)
+    if [ -n "$old_priv" ] && [ -n "$old_pub" ]; then
+      NOISE_PRIV="$old_priv"; NOISE_PUB="$old_pub"
+      ok "Reusing the existing Noise key (Kharej side stays valid)."
+    else
+      info "Generating Noise key ..."
+      local keyout; keyout=$("$BIN" --genkey 2>/dev/null)
+      NOISE_PRIV=$(echo "$keyout" | awk '/Private Key:/{getline; print}' | tr -d ' \r\n')
+      NOISE_PUB=$(echo "$keyout"  | awk '/Public Key:/{getline; print}'  | tr -d ' \r\n')
+      if [ -z "$NOISE_PRIV" ] || [ -z "$NOISE_PUB" ]; then
+        err "Noise key generation failed."; read -rp "Press Enter to go back..."; return
+      fi
     fi
   fi
 
@@ -425,8 +518,7 @@ setup_iran() {
   open_ports "$ports"
 
   echo "iran" > "$ROLE_FILE"
-  echo "PROTO=$PROTO" > "$CONF_DIR/iran.env"
-  echo "PORTS=$ports" >> "$CONF_DIR/iran.env"
+  save_iran_env "$ports"
 
   # --- Final test ---
   sleep 3
@@ -436,7 +528,7 @@ setup_iran() {
   else
     err "The service failed to start! Log: journalctl -u rathole-iran -n 30"
   fi
-  if ss -tln | grep -q ":${TUNNEL_PORT} "; then
+  if port_in_use "$TUNNEL_PORT"; then
     ok "Tunnel port ${TUNNEL_PORT} is in LISTEN state."
   fi
 
@@ -447,7 +539,7 @@ setup_iran() {
   echo -e "  Tunnel port:               ${G}${TUNNEL_PORT}${N}  (fixed, same in both scripts)"
   echo -e "  Token:                     ${G}${TOKEN}${N}  (fixed, same in both scripts)"
   echo -e "  Protocol:                  ${G}${PROTO}${N}"
-  echo -e "  Forward ports:             ${G}$(echo $ports | tr ' ' ',')${N}"
+  echo -e "  Forward ports:             ${G}$(echo $ports | tr ' ' ',')${N}  ${Y}(must be identical on the Kharej side)${N}"
   if [ "$PROTO" = "noise" ]; then
     echo -e "  ${Y}Public Key (enter this on the Kharej side):${N}"
     echo -e "  ${G}${NOISE_PUB}${N}"
@@ -465,6 +557,7 @@ setup_kharej() {
   echo -e "${M}>>> Setting up the Kharej server (Client)${N}"
   echo ""
   install_deps
+  purge_watchdog
   install_core || { read -rp "Press Enter to go back..."; return; }
 
   # --- Number of Iran servers ---
@@ -494,7 +587,9 @@ setup_kharej() {
       err "Invalid IP address."
     done
 
-    echo -e "${C}Forward ports for this server (comma-separated - example: 22,80,2086):${N}"
+    echo -e "${C}Forward ports for this server (comma-separated - example: 22,80,2086)${N}"
+    echo -e "${Y}These must EXACTLY match the ports entered on Iran server #${i}, otherwise${N}"
+    echo -e "${Y}the client retries forever and the tunnel looks 'connected but dead'.${N}"
     ports=""
     while [ -z "$ports" ]; do
       read -rp "Ports: " raw_ports
@@ -506,6 +601,9 @@ setup_kharej() {
     dest="${dest:-127.0.0.1}"
 
     # --- Build client.toml ---
+    # FIX #6: heartbeat_timeout 90 -> 45. rathole only reconnects after this
+    # timeout fires, so 90s meant up to a minute and a half of dead tunnel
+    # before recovery. Must stay greater than server heartbeat_interval (15).
     local conf="$CONF_DIR/kharej-client-${i}.toml"
     [ -f "$conf" ] && cp -f "$conf" "${conf}.bak.$(date +%s)"
     {
@@ -513,7 +611,7 @@ setup_kharej() {
       echo "remote_addr = \"${ip}:${TUNNEL_PORT}\""
       echo "default_token = \"${TOKEN}\""
       echo "retry_interval = 1"
-      echo "heartbeat_timeout = 90"
+      echo "heartbeat_timeout = 45"
       echo ""
       transport_client_block
       echo ""
@@ -559,7 +657,7 @@ setup_kharej() {
   echo -e "$summary"
   echo ""
   echo -e "${Y}Important reminder:${N} run this same script on each Iran server, choose option \"1\", and"
-  echo -e "  make sure the ${G}same protocol (${PROTO})${N} is chosen so both sides of the tunnel match."
+  echo -e "  make sure the ${G}same protocol (${PROTO})${N} and the ${G}same ports${N} are used so both sides match."
   echo ""
   read -rp "Press Enter to return to the menu..."
 }
@@ -586,7 +684,7 @@ show_status() {
   ss -tnp state established 2>/dev/null | grep ":${TUNNEL_PORT}" || echo "  (no active connection found)"
   echo ""
   echo -e "${C}--- Listening ports ---${N}"
-  ss -tln 2>/dev/null | grep -E ":(${TUNNEL_PORT})\b" || true
+  ss -tln 2>/dev/null | grep -E "[:.]${TUNNEL_PORT}[[:space:]]" || true
   echo ""
   read -rp "Press Enter to return to the menu..."
 }
@@ -625,7 +723,9 @@ optimize_net() {
 }
 
 # =============================================================================
-#  Edit ports (quickly rebuild config with the previous protocol)
+#  Edit ports — FIX #4: rebuild the transport block cleanly from the saved
+#  env (protocol + persisted Noise keys) instead of grepping old .bak files,
+#  which mixed multiple backups and destroyed the Noise private key.
 # =============================================================================
 edit_ports() {
   banner
@@ -638,7 +738,10 @@ edit_ports() {
       ports=$(parse_ports "$raw_ports")
       [ -z "$ports" ] && err "No valid port was entered."
     done
-    PROTO=$(grep -oP '(?<=^PROTO=).*' "$CONF_DIR/iran.env" 2>/dev/null); PROTO="${PROTO:-tcp}"
+    check_forward_ports_free "$ports" || { read -rp "Press Enter to go back..."; return; }
+
+    load_iran_env || { err "Saved settings not found; run option 1 again."; read -rp "Press Enter..."; return; }
+
     local conf="$CONF_DIR/iran-server.toml"
     cp -f "$conf" "${conf}.bak.$(date +%s)" 2>/dev/null
     {
@@ -647,7 +750,7 @@ edit_ports() {
       echo "default_token = \"${TOKEN}\""
       echo "heartbeat_interval = 15"
       echo ""
-      grep -A6 '^\[server.transport\]' "${conf}.bak."* 2>/dev/null | head -n 20 | sed '/^--$/d' || transport_server_block
+      transport_server_block
       echo ""
       for p in $ports; do
         echo "[server.services.p${p}]"
@@ -655,8 +758,9 @@ edit_ports() {
         echo ""
       done
     } > "$conf"
-    echo "PORTS=$ports" >> "$CONF_DIR/iran.env"
-    systemctl restart rathole-iran && ok "Config updated and service restarted."
+    save_iran_env "$ports"
+    systemctl reset-failed rathole-iran 2>/dev/null
+    systemctl restart rathole-iran && ok "Config updated and service restarted (protocol: $PROTO)."
     open_ports "$ports"
   elif [ "$role" = "kharej" ]; then
     info "To edit the ports for each Iran server, run option 2 (install Kharej) again;"
@@ -668,27 +772,40 @@ edit_ports() {
 }
 
 # =============================================================================
-#  Full removal
+#  Full removal — now also purges every watchdog trace (service, timer,
+#  script, cron) and any rathole unit from older script versions.
 # =============================================================================
 uninstall_all() {
   banner
   read -rp "Are you sure you want to fully remove the tunnel? (y/N): " c
   [[ "$c" =~ ^[yY]$ ]] || return
+
+  # watchdog first (service, timer, helper script, cron entries)
+  purge_watchdog
+
+  # all rathole units (current naming + any legacy names)
   local u
-  for u in $(systemctl list-unit-files 2>/dev/null | grep -E '^rathole-(iran|kharej)' | awk '{print $1}'); do
+  for u in $(systemctl list-unit-files 2>/dev/null | grep -E '^rathole' | awk '{print $1}'); do
     systemctl disable --now "$u" >/dev/null 2>&1
     rm -f "/etc/systemd/system/${u}"
   done
-  systemctl disable --now rathole-mss-clamp.service >/dev/null 2>&1
-  rm -f /etc/systemd/system/rathole-mss-clamp.service
-  iptables -t mangle -D OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null
+  # legacy unit files that might not be registered anymore
+  rm -f /etc/systemd/system/rathole.service \
+        /etc/systemd/system/rathole-server.service \
+        /etc/systemd/system/rathole-client.service 2>/dev/null
+
   systemctl daemon-reload
-  rm -f "$ROLE_FILE"
+
+  # MSS clamp firewall rule
+  iptables -t mangle -D OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null
+
+  # config, role, binary, tuning
   rm -rf "$CONF_DIR"
   rm -f "$BIN"
   rm -f /etc/sysctl.d/99-rathole-tune.conf
   sysctl --system >/dev/null 2>&1
-  ok "The rathole tunnel has been fully removed."
+
+  ok "The rathole tunnel (and all watchdog leftovers) have been fully removed."
   read -rp "Press Enter to return to the menu..."
 }
 
@@ -708,7 +825,7 @@ main_menu() {
     echo "  5) Network optimization (BBR + MSS clamp)"
     echo "  6) Edit ports"
     echo "  7) Reinstall rathole core (pinned stable version)"
-    echo "  8) Fully remove tunnel"
+    echo "  8) Fully remove tunnel (incl. watchdog leftovers)"
     echo "  0) Exit"
     echo ""
     read -rp "Choice: " ch

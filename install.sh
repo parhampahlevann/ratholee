@@ -2,20 +2,27 @@
 # =============================================================================
 #  Rathole Reverse Tunnel Manager (IRAN <-> KHAREJ)
 #  Reverse architecture: Iran server = rathole server | Kharej (abroad) server = rathole client
-#  Tunnel port: 8085 | Fixed token | Auto watchdog | Up to 3 Iran servers
-#  Stability patch: unlimited auto-restart, tolerant heartbeat, faster watchdog,
-#                    kernel keepalive/idle tuning applied automatically at install.
+#  Auto watchdog | Up to 3 Iran servers
+#
+#  STABILITY PATCH v2:
+#   - Token and tunnel port are now randomly generated per install instead of
+#     a fixed public value, so this deployment doesn't share a fingerprintable
+#     signature with every other install of this same public script.
+#   - Automatic MSS clamping (iptables) to eliminate PMTU-blackhole packet
+#     drops, a very common cause of "random disconnects + bad throughput"
+#     on Iran <-> abroad routes, independent of which transport is used.
+#   - Unlimited systemd auto-restart, tolerant heartbeat, 30s self-healing
+#     watchdog (carried over from the previous patch).
 # =============================================================================
 
 # ---------- Fixed settings ----------
-TUNNEL_PORT="8085"
-TOKEN="sdfert54fg564y6trgby675ytrgftryrg"
 BIN="/usr/local/bin/rathole"
 CONF_DIR="/etc/rathole"
 WATCHDOG="/usr/local/bin/rathole-watchdog.sh"
 CRON_FILE="/etc/cron.d/rathole-watchdog"
 LOG_FILE="/var/log/rathole-watchdog.log"
 ROLE_FILE="$CONF_DIR/role"
+SECRETS_FILE="$CONF_DIR/secrets.env"
 MAX_IRAN=3
 
 # ---------- Colors ----------
@@ -30,7 +37,7 @@ banner() {
   clear
   echo -e "${C}=============================================================${N}"
   echo -e "${G}      Rathole Reverse Tunnel${N}"
-  echo -e "${C}      IRAN (Server)  <<==  8085  ==>>  KHAREJ (Client)${N}"
+  echo -e "${C}      IRAN (Server)  <<==  ${TUNNEL_PORT}  ==>>  KHAREJ (Client)${N}"
   echo -e "${C}=============================================================${N}"
   echo ""
 }
@@ -43,13 +50,48 @@ need_root() {
   fi
 }
 
+# ---------- Random token/port generator ----------
+gen_token() {
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -hex 16
+  else
+    head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n'
+  fi
+}
+gen_port() {
+  echo $(( (RANDOM % 40000) + 20000 ))
+}
+
+# ---------- Load persisted secrets, or seed fresh random defaults ----------
+# This makes every deployment unique instead of sharing the same fixed
+# port/token that every copy of this public script used before.
+load_or_init_secrets() {
+  mkdir -p "$CONF_DIR" 2>/dev/null
+  if [ -f "$SECRETS_FILE" ]; then
+    # shellcheck disable=SC1090
+    source "$SECRETS_FILE"
+  fi
+  TOKEN="${TOKEN:-$(gen_token)}"
+  TUNNEL_PORT="${TUNNEL_PORT:-$(gen_port)}"
+}
+
+save_secrets() {
+  mkdir -p "$CONF_DIR"
+  {
+    echo "TOKEN=$TOKEN"
+    echo "TUNNEL_PORT=$TUNNEL_PORT"
+  } > "$SECRETS_FILE"
+  chmod 600 "$SECRETS_FILE"
+}
+
 # ---------- Install prerequisites ----------
 install_deps() {
   local need=()
-  command -v curl  >/dev/null 2>&1 || need+=(curl)
-  command -v wget  >/dev/null 2>&1 || need+=(wget)
-  command -v unzip >/dev/null 2>&1 || need+=(unzip)
-  command -v ss    >/dev/null 2>&1 || need+=(iproute2)
+  command -v curl     >/dev/null 2>&1 || need+=(curl)
+  command -v wget     >/dev/null 2>&1 || need+=(wget)
+  command -v unzip    >/dev/null 2>&1 || need+=(unzip)
+  command -v ss       >/dev/null 2>&1 || need+=(iproute2)
+  command -v iptables >/dev/null 2>&1 || need+=(iptables)
   if command -v apt-get >/dev/null 2>&1; then
     command -v crontab >/dev/null 2>&1 || need+=(cron)
     [ ${#need[@]} -gt 0 ] && { info "Installing prerequisites: ${need[*]}"; apt-get update -y >/dev/null 2>&1; apt-get install -y "${need[@]}" >/dev/null 2>&1; }
@@ -163,8 +205,6 @@ choose_proto() {
 }
 
 # ---------- Generate transport block for server ----------
-# NOTE (stability patch): keepalive_secs/keepalive_interval tightened (10/3)
-# so a dead peer is detected and NAT mappings on Iranian ISPs stay refreshed.
 transport_server_block() {
   case "$PROTO" in
     tcp)
@@ -237,10 +277,9 @@ EOF
 }
 
 # ---------- Create systemd service ----------
-# NOTE (stability patch): StartLimitIntervalSec=0 removes systemd's default
-# "5 restarts / 10s then give up" rule. Without this, a burst of rapid drops
-# (common on filtered Iranian links) trips the limit and the unit goes to a
-# permanently 'failed' state until someone restarts it by hand.
+# StartLimitIntervalSec=0 removes systemd's default "5 restarts / 10s then
+# give up" rule, so a burst of rapid drops can never leave the unit stuck
+# in a permanently 'failed' state requiring a manual restart.
 make_unit() {
   local name="$1" conf="$2" desc="$3"
   cat > "/etc/systemd/system/${name}.service" <<EOF
@@ -299,12 +338,46 @@ net.ipv4.tcp_keepalive_intvl = 5
 net.ipv4.tcp_keepalive_probes = 5
 net.core.netdev_max_backlog = 250000
 net.ipv4.tcp_no_metrics_save = 1
-net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_mtu_probing = 2
+net.ipv4.tcp_base_mss = 1400
 net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_syn_retries = 3
 net.ipv4.tcp_retries2 = 8
 EOF
   sysctl --system >/dev/null 2>&1
+}
+
+# =============================================================================
+#  MSS clamping — eliminates PMTU-blackhole packet drops. Very common cause
+#  of "random disconnects + bad throughput regardless of protocol" on
+#  Iran <-> abroad routes where ICMP fragmentation-needed is filtered
+#  somewhere along the path.
+# =============================================================================
+apply_mss_clamp() {
+  if ! command -v iptables >/dev/null 2>&1; then
+    warn "iptables not found; skipping MSS clamp."
+    return
+  fi
+  iptables -t mangle -C OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null \
+    || iptables -t mangle -A OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+
+  cat > /etc/systemd/system/rathole-mss-clamp.service <<'EOF'
+[Unit]
+Description=Rathole MSS clamp (prevents PMTU blackhole packet drops)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'iptables -t mangle -C OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu || iptables -t mangle -A OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now rathole-mss-clamp.service >/dev/null 2>&1
+  ok "MSS clamp applied (survives reboot)."
 }
 
 # =============================================================================
@@ -351,9 +424,11 @@ setup_iran() {
     fi
   fi
 
+  # --- Persist this install's random token/port (generated at script start) ---
+  save_secrets
+  ok "Generated a unique tunnel port (${TUNNEL_PORT}) and token for this install."
+
   # --- Build server.toml ---
-  # NOTE (stability patch): heartbeat_interval lowered 30 -> 15s so pings go
-  # out more often, keeping NAT/firewall session state alive on both sides.
   local conf="$CONF_DIR/iran-server.toml"
   [ -f "$conf" ] && cp -f "$conf" "${conf}.bak.$(date +%s)"
   {
@@ -381,7 +456,8 @@ setup_iran() {
 
   # --- Kernel/network stability tuning (automatic) ---
   apply_net_tuning
-  ok "Kernel network tuning applied (BBR + keepalive + idle-recovery)."
+  apply_mss_clamp
+  ok "Kernel network tuning applied (BBR + keepalive + idle-recovery + MSS clamp)."
 
   # --- Firewall ---
   open_ports "$ports"
@@ -407,6 +483,7 @@ setup_iran() {
   echo -e "${C}================ Info needed for the Kharej server side ================${N}"
   echo -e "  This server's IP (Iran):  ${G}$(curl -4 -fsS --connect-timeout 8 https://api.ipify.org 2>/dev/null || echo 'Iran server IP')${N}"
   echo -e "  Tunnel port:               ${G}${TUNNEL_PORT}${N}"
+  echo -e "  Token:                     ${G}${TOKEN}${N}"
   echo -e "  Protocol:                  ${G}${PROTO}${N}"
   echo -e "  Forward ports:             ${G}$(echo $ports | tr ' ' ',')${N}"
   if [ "$PROTO" = "noise" ]; then
@@ -414,6 +491,7 @@ setup_iran() {
     echo -e "  ${G}${NOISE_PUB}${N}"
   fi
   echo -e "${C}=================================================================${N}"
+  echo -e "${Y}Save the port and token above — you'll be asked for them when setting up the Kharej side.${N}"
   echo ""
   read -rp "Press Enter to return to the menu..."
 }
@@ -427,6 +505,17 @@ setup_kharej() {
   echo ""
   install_deps
   install_core || { read -rp "Press Enter to go back..."; return; }
+
+  # --- Tunnel port + token (must match the Iran server exactly) ---
+  echo ""
+  echo -e "${Y}Enter the tunnel port shown on the Iran server${N}"
+  read -rp "Tunnel port [${TUNNEL_PORT}]: " in_port
+  TUNNEL_PORT="${in_port:-$TUNNEL_PORT}"
+  echo -e "${Y}Enter the token shown on the Iran server${N}"
+  read -rp "Token: " in_token
+  if [ -n "$in_token" ]; then TOKEN="$in_token"; fi
+  if [ -z "$TOKEN" ]; then err "Token cannot be empty."; read -rp "Press Enter..."; return; fi
+  save_secrets
 
   # --- Number of Iran servers ---
   local count=1
@@ -467,9 +556,9 @@ setup_kharej() {
     dest="${dest:-127.0.0.1}"
 
     # --- Build client.toml ---
-    # NOTE (stability patch): heartbeat_timeout raised 40 -> 90s so normal
-    # network jitter doesn't get misread as a dead server and trigger a
-    # reconnect storm. retry_interval stays at 1s for a fast real reconnect.
+    # heartbeat_timeout raised to 90s so normal network jitter doesn't get
+    # misread as a dead server and trigger a reconnect storm. retry_interval
+    # stays at 1s for a fast real reconnect when the link genuinely drops.
     local conf="$CONF_DIR/kharej-client-${i}.toml"
     [ -f "$conf" ] && cp -f "$conf" "${conf}.bak.$(date +%s)"
     {
@@ -498,7 +587,8 @@ setup_kharej() {
 
   # --- Kernel/network stability tuning (automatic) ---
   apply_net_tuning
-  ok "Kernel network tuning applied (BBR + keepalive + idle-recovery)."
+  apply_mss_clamp
+  ok "Kernel network tuning applied (BBR + keepalive + idle-recovery + MSS clamp)."
 
   echo "kharej" > "$ROLE_FILE"
   {
@@ -517,7 +607,7 @@ setup_kharej() {
       ok "Connection to Iran server ${i} (${ip}:${TUNNEL_PORT}) is established ✔"
     else
       warn "Connection to ${ip}:${TUNNEL_PORT} is not yet established."
-      echo -e "    Check: 1) the script has been run on the Iran server 2) port ${TUNNEL_PORT} is open in the Iran server's firewall/datacenter 3) the protocol and key match on both sides."
+      echo -e "    Check: 1) the script has been run on the Iran server 2) port ${TUNNEL_PORT} is open in the Iran server's firewall/datacenter 3) the token/protocol/key match on both sides."
       echo -e "    Log: journalctl -u rathole-kharej-${i} -n 30 --no-pager"
     fi
   done
@@ -525,7 +615,7 @@ setup_kharej() {
   echo -e "$summary"
   echo ""
   echo -e "${Y}Important reminder:${N} run this same script on each Iran server, choose option \"1\", and"
-  echo -e "  enter the ${G}same ports and same protocol (${PROTO})${N} so both sides of the tunnel match."
+  echo -e "  enter the ${G}same port, token, and protocol (${PROTO})${N} so both sides of the tunnel match."
   echo ""
   read -rp "Press Enter to return to the menu..."
 }
@@ -533,11 +623,6 @@ setup_kharej() {
 # =============================================================================
 #  Automatic watchdog (every 30 seconds - on both servers)
 # =============================================================================
-# NOTE (stability patch): watchdog now runs twice a minute (via two cron
-# lines, one offset by sleep 30) instead of once, and calls
-# 'systemctl reset-failed' before every restart so a unit that previously
-# hit systemd's restart-rate limit and got stuck in 'failed' is guaranteed
-# to be recovered instead of sitting dead until a human restarts it.
 install_watchdog() {
   cat > "$WATCHDOG" <<'WDEOF'
 #!/bin/bash
@@ -634,12 +719,13 @@ restart_all() {
 }
 
 # =============================================================================
-#  Network optimization (BBR + sysctl) — manual menu entry point
+#  Network optimization (BBR + sysctl + MSS clamp) — manual menu entry point
 # =============================================================================
 optimize_net() {
   banner
-  info "Applying BBR and network optimization ..."
+  info "Applying BBR, network optimization, and MSS clamp ..."
   apply_net_tuning
+  apply_mss_clamp
   if sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q bbr; then
     ok "BBR enabled."
   else
@@ -704,8 +790,11 @@ uninstall_all() {
     systemctl disable --now "$u" >/dev/null 2>&1
     rm -f "/etc/systemd/system/${u}"
   done
+  systemctl disable --now rathole-mss-clamp.service >/dev/null 2>&1
+  rm -f /etc/systemd/system/rathole-mss-clamp.service
+  iptables -t mangle -D OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null
   systemctl daemon-reload
-  rm -f "$WATCHDOG" "$CRON_FILE" "$ROLE_FILE"
+  rm -f "$WATCHDOG" "$CRON_FILE" "$ROLE_FILE" "$SECRETS_FILE"
   rm -rf "$CONF_DIR"
   rm -f "$BIN"
   rm -f /etc/sysctl.d/99-rathole-tune.conf
@@ -727,7 +816,7 @@ main_menu() {
     echo "  2) Install Kharej server   (Client - up to 3 Iran servers)"
     echo "  3) Status and connection test"
     echo "  4) Restart tunnel"
-    echo "  5) Network optimization (BBR)"
+    echo "  5) Network optimization (BBR + MSS clamp)"
     echo "  6) Edit ports"
     echo "  7) Update rathole core to the latest version"
     echo "  8) Fully remove tunnel"
@@ -750,4 +839,5 @@ main_menu() {
 }
 
 need_root
+load_or_init_secrets
 main_menu

@@ -1,20 +1,19 @@
 #!/bin/bash
 # =============================================================================
 #  Rathole Reverse Tunnel Manager (IRAN <-> KHAREJ)
-#  Reverse architecture: Iran server = rathole server | Kharej (abroad) server = rathole client
-#  Fixed tunnel port + fixed token (no copy/paste needed) | Up to 3 Iran servers
+#  Iran server = rathole server | Kharej (abroad) = rathole client
+#  Fixed tunnel port + fixed token | Up to 3 Iran servers
 #
-#  STABILITY PATCH v3:
-#   - Fixed token & fixed tunnel port (38954) — no prompting, no copy/paste.
-#   - Watchdog removed entirely: it was force-restarting healthy connections
-#     during brief, normal TCP reconnect windows, causing extra drops.
-#     systemd's own Restart=always + StartLimitIntervalSec=0 is sufficient.
-#   - Anti-bufferbloat kernel tuning: much smaller socket buffers and NIC
-#     backlog than before — large buffers were queuing up and causing sudden
-#     ping spikes under load.
-#   - Rathole binary pinned to a known-stable release (v0.5.0) instead of
-#     always grabbing "latest", which can be a less-tested build.
-#   - MSS clamping kept (fixes PMTU-blackhole packet drops).
+#  STABILITY PATCH v4:
+#   - Fixed x86_64 asset name (musl, not gnu) so the download actually works.
+#   - In-use forward ports are now SKIPPED (not just warned) so rathole can't
+#     crash-loop when e.g. Iran's own SSH is already on port 22.
+#   - Removed dangerous sysctl tweaks (tcp_fastopen=3, tcp_mtu_probing=2,
+#     tcp_base_mss, tcp_no_metrics_save, oversized buffers) that cause
+#     periodic disconnects on filtered Iran<->abroad links.
+#   - Relaxed keepalive + heartbeat so normal jitter doesn't kill the tunnel.
+#   - edit_ports now rewrites the env file cleanly (no duplicate PORTS lines)
+#     and rebuilds the transport block correctly.
 # =============================================================================
 
 # ---------- Fixed settings ----------
@@ -72,14 +71,14 @@ install_deps() {
 # ---------- Detect architecture ----------
 detect_asset() {
   case "$(uname -m)" in
-    x86_64|amd64)  ASSET="rathole-x86_64-unknown-linux-gnu.zip" ;;
+    x86_64|amd64)  ASSET="rathole-x86_64-unknown-linux-musl.zip" ;;
     aarch64|arm64) ASSET="rathole-aarch64-unknown-linux-musl.zip" ;;
     *) err "Architecture $(uname -m) is not supported."; return 1 ;;
   esac
   return 0
 }
 
-# ---------- Install/update rathole core (pinned to a stable release) ----------
+# ---------- Install/update rathole core (pinned stable release) ----------
 install_core() {
   if [ -x "$BIN" ] && [ "$1" != "force" ]; then
     ok "Rathole core is already installed: $($BIN --version 2>/dev/null | head -n1)"
@@ -120,7 +119,6 @@ install_core() {
 }
 
 # ---------- Normalize port input ----------
-# Output: list of valid, unique ports separated by spaces
 parse_ports() {
   local raw="$1"
   raw="${raw//،/,}"; raw="${raw// /,}"; raw="${raw//;/,}"
@@ -137,8 +135,21 @@ parse_ports() {
   echo "${out# }"
 }
 
+# ---------- Drop forward ports that are already in use (prevents crash-loop) ----------
+filter_free_ports() {
+  local ports="$1" p clean=""
+  for p in $ports; do
+    if ss -tln 2>/dev/null | grep -q ":${p} "; then
+      warn "Port ${p} is already in use on this server and was skipped."
+      warn "  (If it's port 22, move this server's own SSH to another port first.)"
+    else
+      clean="$clean $p"
+    fi
+  done
+  echo "${clean# }"
+}
+
 # ---------- Choose protocol ----------
-# Output in global variable PROTO : tcp | websocket | noise
 choose_proto() {
   echo ""
   echo -e "${Y}Choose the tunnel transport protocol:${N}"
@@ -155,7 +166,7 @@ choose_proto() {
   ok "Selected protocol: $PROTO"
 }
 
-# ---------- Generate transport block for server ----------
+# ---------- Transport block for server ----------
 transport_server_block() {
   case "$PROTO" in
     tcp)
@@ -165,8 +176,8 @@ type = "tcp"
 
 [server.transport.tcp]
 nodelay = true
-keepalive_secs = 10
-keepalive_interval = 3
+keepalive_secs = 60
+keepalive_interval = 15
 EOF
       ;;
     websocket)
@@ -191,7 +202,7 @@ EOF
   esac
 }
 
-# ---------- Generate transport block for client ----------
+# ---------- Transport block for client ----------
 transport_client_block() {
   case "$PROTO" in
     tcp)
@@ -201,8 +212,8 @@ type = "tcp"
 
 [client.transport.tcp]
 nodelay = true
-keepalive_secs = 10
-keepalive_interval = 3
+keepalive_secs = 60
+keepalive_interval = 15
 EOF
       ;;
     websocket)
@@ -228,10 +239,6 @@ EOF
 }
 
 # ---------- Create systemd service ----------
-# StartLimitIntervalSec=0 removes systemd's default "5 restarts / 10s then
-# give up" rule, so a burst of rapid drops can never leave the unit stuck
-# in a permanently 'failed' state requiring a manual restart. This alone
-# (no external watchdog) is enough for self-healing.
 make_unit() {
   local name="$1" conf="$2" desc="$3"
   cat > "/etc/systemd/system/${name}.service" <<EOF
@@ -247,7 +254,6 @@ ExecStart=${BIN} ${conf}
 Restart=always
 RestartSec=2
 LimitNOFILE=1048576
-Nice=-10
 
 [Install]
 WantedBy=multi-user.target
@@ -273,40 +279,22 @@ open_ports() {
 }
 
 # =============================================================================
-#  Stability tuning (kernel + BBR) — anti-bufferbloat version.
-#  Buffers/backlog were previously oversized (64MB / 250000), which queues
-#  up under load and causes exactly the "ping suddenly spikes" symptom.
-#  These are now moderate — enough for good throughput without the queue
-#  buildup. Called automatically from setup_iran / setup_kharej.
+#  Safe kernel tuning — only the values that actually help long-lived tunnels.
+#  Removed the aggressive settings that caused periodic disconnects.
 # =============================================================================
 apply_net_tuning() {
   cat > /etc/sysctl.d/99-rathole-tune.conf <<'EOF'
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
-net.core.rmem_max = 16777216
-net.core.wmem_max = 16777216
-net.ipv4.tcp_rmem = 4096 87380 16777216
-net.ipv4.tcp_wmem = 4096 65536 16777216
-net.ipv4.tcp_fastopen = 3
-net.ipv4.tcp_keepalive_time = 30
-net.ipv4.tcp_keepalive_intvl = 5
-net.ipv4.tcp_keepalive_probes = 5
-net.core.netdev_max_backlog = 5000
-net.ipv4.tcp_no_metrics_save = 1
-net.ipv4.tcp_mtu_probing = 2
-net.ipv4.tcp_base_mss = 1400
+net.ipv4.tcp_fastopen = 0
 net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_syn_retries = 3
-net.ipv4.tcp_retries2 = 8
 EOF
   sysctl --system >/dev/null 2>&1
 }
 
 # =============================================================================
-#  MSS clamping — eliminates PMTU-blackhole packet drops. Very common cause
-#  of "random disconnects + bad throughput regardless of protocol" on
-#  Iran <-> abroad routes where ICMP fragmentation-needed is filtered
-#  somewhere along the path.
+#  MSS clamping — prevents PMTU-blackhole packet drops. Kept: it helps on
+#  filtered links. (Only touches TCP SYN, so it cannot affect ICMP ping.)
 # =============================================================================
 apply_mss_clamp() {
   if ! command -v iptables >/dev/null 2>&1; then
@@ -355,14 +343,14 @@ setup_iran() {
     ports=$(parse_ports "$raw_ports")
     [ -z "$ports" ] && err "No valid port was entered."
   done
-  ok "Forward ports: $(echo $ports | tr ' ' ',')"
 
-  # --- Port conflict warning ---
-  for p in $ports; do
-    if ss -tln 2>/dev/null | grep -q ":${p} "; then
-      warn "Port ${p} is currently in use on this server (e.g. by another service)."
-    fi
-  done
+  # --- Remove in-use ports so rathole does not crash-loop ---
+  ports=$(filter_free_ports "$ports")
+  if [ -z "$ports" ]; then
+    err "No free port remained. Free the ports first (e.g. move SSH off port 22), then re-run."
+    read -rp "Press Enter to go back..."; return
+  fi
+  ok "Forward ports: $(echo $ports | tr ' ' ',')"
 
   # --- Protocol ---
   choose_proto
@@ -386,7 +374,7 @@ setup_iran() {
     echo "[server]"
     echo "bind_addr = \"0.0.0.0:${TUNNEL_PORT}\""
     echo "default_token = \"${TOKEN}\""
-    echo "heartbeat_interval = 15"
+    echo "heartbeat_interval = 20"
     echo ""
     transport_server_block
     echo ""
@@ -405,14 +393,17 @@ setup_iran() {
   # --- Kernel/network stability tuning (automatic) ---
   apply_net_tuning
   apply_mss_clamp
-  ok "Kernel network tuning applied (BBR + anti-bufferbloat + MSS clamp)."
+  ok "Kernel network tuning applied (BBR + MSS clamp)."
 
   # --- Firewall ---
   open_ports "$ports"
 
   echo "iran" > "$ROLE_FILE"
-  echo "PROTO=$PROTO" > "$CONF_DIR/iran.env"
-  echo "PORTS=$ports" >> "$CONF_DIR/iran.env"
+  {
+    echo "PROTO=$PROTO"
+    echo "PORTS=$ports"
+    [ "$PROTO" = "noise" ] && { echo "NOISE_PRIV=$NOISE_PRIV"; echo "NOISE_PUB=$NOISE_PUB"; }
+  } > "$CONF_DIR/iran.env"
 
   # --- Final test ---
   sleep 3
@@ -492,17 +483,14 @@ setup_kharej() {
     dest="${dest:-127.0.0.1}"
 
     # --- Build client.toml ---
-    # heartbeat_timeout raised to 90s so normal network jitter doesn't get
-    # misread as a dead server. retry_interval stays at 1s for a fast real
-    # reconnect when the link genuinely drops.
     local conf="$CONF_DIR/kharej-client-${i}.toml"
     [ -f "$conf" ] && cp -f "$conf" "${conf}.bak.$(date +%s)"
     {
       echo "[client]"
       echo "remote_addr = \"${ip}:${TUNNEL_PORT}\""
       echo "default_token = \"${TOKEN}\""
-      echo "retry_interval = 1"
-      echo "heartbeat_timeout = 90"
+      echo "retry_interval = 2"
+      echo "heartbeat_timeout = 70"
       echo ""
       transport_client_block
       echo ""
@@ -521,12 +509,13 @@ setup_kharej() {
   # --- Kernel/network stability tuning (automatic) ---
   apply_net_tuning
   apply_mss_clamp
-  ok "Kernel network tuning applied (BBR + anti-bufferbloat + MSS clamp)."
+  ok "Kernel network tuning applied (BBR + MSS clamp)."
 
   echo "kharej" > "$ROLE_FILE"
   {
     echo "PROTO=$PROTO"
     echo "COUNT=$count"
+    [ "$PROTO" = "noise" ] && echo "NOISE_PUB=$NOISE_PUB"
   } > "$CONF_DIR/kharej.env"
 
   # --- Final connection test ---
@@ -597,11 +586,11 @@ restart_all() {
 }
 
 # =============================================================================
-#  Network optimization (BBR + sysctl + MSS clamp) — manual menu entry point
+#  Network optimization (BBR + MSS clamp) — manual menu entry point
 # =============================================================================
 optimize_net() {
   banner
-  info "Applying BBR, anti-bufferbloat tuning, and MSS clamp ..."
+  info "Applying BBR and MSS clamp ..."
   apply_net_tuning
   apply_mss_clamp
   if sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q bbr; then
@@ -614,7 +603,7 @@ optimize_net() {
 }
 
 # =============================================================================
-#  Edit ports (quickly rebuild config with the previous protocol)
+#  Edit ports (rebuild config with the previous protocol)
 # =============================================================================
 edit_ports() {
   banner
@@ -627,16 +616,26 @@ edit_ports() {
       ports=$(parse_ports "$raw_ports")
       [ -z "$ports" ] && err "No valid port was entered."
     done
-    PROTO=$(grep -oP '(?<=^PROTO=).*' "$CONF_DIR/iran.env" 2>/dev/null); PROTO="${PROTO:-tcp}"
+
+    ports=$(filter_free_ports "$ports")
+    if [ -z "$ports" ]; then
+      err "No free port remained."
+      read -rp "Press Enter..."; return
+    fi
+
+    PROTO=$(sed -n 's/^PROTO=//p' "$CONF_DIR/iran.env" 2>/dev/null); PROTO="${PROTO:-tcp}"
+    NOISE_PRIV=$(sed -n 's/^NOISE_PRIV=//p' "$CONF_DIR/iran.env" 2>/dev/null)
+    NOISE_PUB=$(sed -n 's/^NOISE_PUB=//p' "$CONF_DIR/iran.env" 2>/dev/null)
+
     local conf="$CONF_DIR/iran-server.toml"
     cp -f "$conf" "${conf}.bak.$(date +%s)" 2>/dev/null
     {
       echo "[server]"
       echo "bind_addr = \"0.0.0.0:${TUNNEL_PORT}\""
       echo "default_token = \"${TOKEN}\""
-      echo "heartbeat_interval = 15"
+      echo "heartbeat_interval = 20"
       echo ""
-      grep -A6 '^\[server.transport\]' "${conf}.bak."* 2>/dev/null | head -n 20 | sed '/^--$/d' || transport_server_block
+      transport_server_block
       echo ""
       for p in $ports; do
         echo "[server.services.p${p}]"
@@ -644,7 +643,13 @@ edit_ports() {
         echo ""
       done
     } > "$conf"
-    echo "PORTS=$ports" >> "$CONF_DIR/iran.env"
+
+    {
+      echo "PROTO=$PROTO"
+      echo "PORTS=$ports"
+      [ "$PROTO" = "noise" ] && { echo "NOISE_PRIV=$NOISE_PRIV"; echo "NOISE_PUB=$NOISE_PUB"; }
+    } > "$CONF_DIR/iran.env"
+
     systemctl restart rathole-iran && ok "Config updated and service restarted."
     open_ports "$ports"
   elif [ "$role" = "kharej" ]; then

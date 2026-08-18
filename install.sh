@@ -2,27 +2,28 @@
 # =============================================================================
 #  Rathole Reverse Tunnel Manager (IRAN <-> KHAREJ)
 #  Reverse architecture: Iran server = rathole server | Kharej (abroad) server = rathole client
-#  Auto watchdog | Up to 3 Iran servers
+#  Fixed tunnel port + fixed token (no copy/paste needed) | Up to 3 Iran servers
 #
-#  STABILITY PATCH v2:
-#   - Token and tunnel port are now randomly generated per install instead of
-#     a fixed public value, so this deployment doesn't share a fingerprintable
-#     signature with every other install of this same public script.
-#   - Automatic MSS clamping (iptables) to eliminate PMTU-blackhole packet
-#     drops, a very common cause of "random disconnects + bad throughput"
-#     on Iran <-> abroad routes, independent of which transport is used.
-#   - Unlimited systemd auto-restart, tolerant heartbeat, 30s self-healing
-#     watchdog (carried over from the previous patch).
+#  STABILITY PATCH v3:
+#   - Fixed token & fixed tunnel port (38954) — no prompting, no copy/paste.
+#   - Watchdog removed entirely: it was force-restarting healthy connections
+#     during brief, normal TCP reconnect windows, causing extra drops.
+#     systemd's own Restart=always + StartLimitIntervalSec=0 is sufficient.
+#   - Anti-bufferbloat kernel tuning: much smaller socket buffers and NIC
+#     backlog than before — large buffers were queuing up and causing sudden
+#     ping spikes under load.
+#   - Rathole binary pinned to a known-stable release (v0.5.0) instead of
+#     always grabbing "latest", which can be a less-tested build.
+#   - MSS clamping kept (fixes PMTU-blackhole packet drops).
 # =============================================================================
 
 # ---------- Fixed settings ----------
+TUNNEL_PORT="38954"
+TOKEN="rH7kQ2vXpL9mZ4wT6nB8sD3fG5jC1yA0"
+RATHOLE_VERSION="v0.5.0"
 BIN="/usr/local/bin/rathole"
 CONF_DIR="/etc/rathole"
-WATCHDOG="/usr/local/bin/rathole-watchdog.sh"
-CRON_FILE="/etc/cron.d/rathole-watchdog"
-LOG_FILE="/var/log/rathole-watchdog.log"
 ROLE_FILE="$CONF_DIR/role"
-SECRETS_FILE="$CONF_DIR/secrets.env"
 MAX_IRAN=3
 
 # ---------- Colors ----------
@@ -50,40 +51,6 @@ need_root() {
   fi
 }
 
-# ---------- Random token/port generator ----------
-gen_token() {
-  if command -v openssl >/dev/null 2>&1; then
-    openssl rand -hex 16
-  else
-    head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n'
-  fi
-}
-gen_port() {
-  echo $(( (RANDOM % 40000) + 20000 ))
-}
-
-# ---------- Load persisted secrets, or seed fresh random defaults ----------
-# This makes every deployment unique instead of sharing the same fixed
-# port/token that every copy of this public script used before.
-load_or_init_secrets() {
-  mkdir -p "$CONF_DIR" 2>/dev/null
-  if [ -f "$SECRETS_FILE" ]; then
-    # shellcheck disable=SC1090
-    source "$SECRETS_FILE"
-  fi
-  TOKEN="${TOKEN:-$(gen_token)}"
-  TUNNEL_PORT="${TUNNEL_PORT:-$(gen_port)}"
-}
-
-save_secrets() {
-  mkdir -p "$CONF_DIR"
-  {
-    echo "TOKEN=$TOKEN"
-    echo "TUNNEL_PORT=$TUNNEL_PORT"
-  } > "$SECRETS_FILE"
-  chmod 600 "$SECRETS_FILE"
-}
-
 # ---------- Install prerequisites ----------
 install_deps() {
   local need=()
@@ -93,18 +60,12 @@ install_deps() {
   command -v ss       >/dev/null 2>&1 || need+=(iproute2)
   command -v iptables >/dev/null 2>&1 || need+=(iptables)
   if command -v apt-get >/dev/null 2>&1; then
-    command -v crontab >/dev/null 2>&1 || need+=(cron)
     [ ${#need[@]} -gt 0 ] && { info "Installing prerequisites: ${need[*]}"; apt-get update -y >/dev/null 2>&1; apt-get install -y "${need[@]}" >/dev/null 2>&1; }
   elif command -v dnf >/dev/null 2>&1; then
-    command -v crontab >/dev/null 2>&1 || need+=(cronie)
     [ ${#need[@]} -gt 0 ] && { info "Installing prerequisites: ${need[*]}"; dnf install -y "${need[@]}" >/dev/null 2>&1; }
   elif command -v yum >/dev/null 2>&1; then
-    command -v crontab >/dev/null 2>&1 || need+=(cronie)
     [ ${#need[@]} -gt 0 ] && { info "Installing prerequisites: ${need[*]}"; yum install -y "${need[@]}" >/dev/null 2>&1; }
   fi
-  # Start cron
-  systemctl enable --now cron  >/dev/null 2>&1
-  systemctl enable --now crond >/dev/null 2>&1
   ok "Prerequisites are ready."
 }
 
@@ -118,30 +79,20 @@ detect_asset() {
   return 0
 }
 
-# ---------- Get latest core release ----------
-latest_tag() {
-  local tag=""
-  tag=$(curl -fsSL --connect-timeout 10 "https://api.github.com/repos/rathole-org/rathole/releases/latest" 2>/dev/null | grep -m1 '"tag_name"' | cut -d'"' -f4)
-  [ -z "$tag" ] && tag=$(curl -fsSL --connect-timeout 10 "https://api.github.com/repos/rapiz1/rathole/releases/latest" 2>/dev/null | grep -m1 '"tag_name"' | cut -d'"' -f4)
-  [ -z "$tag" ] && tag="v0.5.0"
-  echo "$tag"
-}
-
-# ---------- Install/update rathole core ----------
+# ---------- Install/update rathole core (pinned to a stable release) ----------
 install_core() {
   if [ -x "$BIN" ] && [ "$1" != "force" ]; then
     ok "Rathole core is already installed: $($BIN --version 2>/dev/null | head -n1)"
     return 0
   fi
   detect_asset || return 1
-  local tag; tag=$(latest_tag)
-  info "Downloading latest rathole core release ($tag) ..."
+  info "Downloading rathole core (pinned stable release ${RATHOLE_VERSION}) ..."
   local urls=(
-    "https://github.com/rathole-org/rathole/releases/download/${tag}/${ASSET}"
-    "https://github.com/rapiz1/rathole/releases/download/${tag}/${ASSET}"
-    "https://ghproxy.net/https://github.com/rathole-org/rathole/releases/download/${tag}/${ASSET}"
-    "https://ghfast.top/https://github.com/rathole-org/rathole/releases/download/${tag}/${ASSET}"
-    "https://mirror.ghproxy.com/https://github.com/rathole-org/rathole/releases/download/${tag}/${ASSET}"
+    "https://github.com/rathole-org/rathole/releases/download/${RATHOLE_VERSION}/${ASSET}"
+    "https://github.com/rapiz1/rathole/releases/download/${RATHOLE_VERSION}/${ASSET}"
+    "https://ghproxy.net/https://github.com/rathole-org/rathole/releases/download/${RATHOLE_VERSION}/${ASSET}"
+    "https://ghfast.top/https://github.com/rathole-org/rathole/releases/download/${RATHOLE_VERSION}/${ASSET}"
+    "https://mirror.ghproxy.com/https://github.com/rathole-org/rathole/releases/download/${RATHOLE_VERSION}/${ASSET}"
   )
   local tmp; tmp=$(mktemp -d)
   local done_dl=0
@@ -279,7 +230,8 @@ EOF
 # ---------- Create systemd service ----------
 # StartLimitIntervalSec=0 removes systemd's default "5 restarts / 10s then
 # give up" rule, so a burst of rapid drops can never leave the unit stuck
-# in a permanently 'failed' state requiring a manual restart.
+# in a permanently 'failed' state requiring a manual restart. This alone
+# (no external watchdog) is enough for self-healing.
 make_unit() {
   local name="$1" conf="$2" desc="$3"
   cat > "/etc/systemd/system/${name}.service" <<EOF
@@ -321,22 +273,25 @@ open_ports() {
 }
 
 # =============================================================================
-#  Stability tuning (kernel + BBR) — silent version, called automatically
-#  from setup_iran / setup_kharej so every fresh install gets it.
+#  Stability tuning (kernel + BBR) — anti-bufferbloat version.
+#  Buffers/backlog were previously oversized (64MB / 250000), which queues
+#  up under load and causes exactly the "ping suddenly spikes" symptom.
+#  These are now moderate — enough for good throughput without the queue
+#  buildup. Called automatically from setup_iran / setup_kharej.
 # =============================================================================
 apply_net_tuning() {
   cat > /etc/sysctl.d/99-rathole-tune.conf <<'EOF'
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
-net.core.rmem_max = 67108864
-net.core.wmem_max = 67108864
-net.ipv4.tcp_rmem = 4096 87380 67108864
-net.ipv4.tcp_wmem = 4096 87380 67108864
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.ipv4.tcp_rmem = 4096 87380 16777216
+net.ipv4.tcp_wmem = 4096 65536 16777216
 net.ipv4.tcp_fastopen = 3
 net.ipv4.tcp_keepalive_time = 30
 net.ipv4.tcp_keepalive_intvl = 5
 net.ipv4.tcp_keepalive_probes = 5
-net.core.netdev_max_backlog = 250000
+net.core.netdev_max_backlog = 5000
 net.ipv4.tcp_no_metrics_save = 1
 net.ipv4.tcp_mtu_probing = 2
 net.ipv4.tcp_base_mss = 1400
@@ -424,10 +379,6 @@ setup_iran() {
     fi
   fi
 
-  # --- Persist this install's random token/port (generated at script start) ---
-  save_secrets
-  ok "Generated a unique tunnel port (${TUNNEL_PORT}) and token for this install."
-
   # --- Build server.toml ---
   local conf="$CONF_DIR/iran-server.toml"
   [ -f "$conf" ] && cp -f "$conf" "${conf}.bak.$(date +%s)"
@@ -451,13 +402,10 @@ setup_iran() {
   make_unit "rathole-iran" "$conf" "Rathole Iran Server (Reverse Tunnel)"
   ok "The rathole-iran service is enabled and running."
 
-  # --- Watchdog ---
-  install_watchdog
-
   # --- Kernel/network stability tuning (automatic) ---
   apply_net_tuning
   apply_mss_clamp
-  ok "Kernel network tuning applied (BBR + keepalive + idle-recovery + MSS clamp)."
+  ok "Kernel network tuning applied (BBR + anti-bufferbloat + MSS clamp)."
 
   # --- Firewall ---
   open_ports "$ports"
@@ -482,8 +430,8 @@ setup_iran() {
   echo ""
   echo -e "${C}================ Info needed for the Kharej server side ================${N}"
   echo -e "  This server's IP (Iran):  ${G}$(curl -4 -fsS --connect-timeout 8 https://api.ipify.org 2>/dev/null || echo 'Iran server IP')${N}"
-  echo -e "  Tunnel port:               ${G}${TUNNEL_PORT}${N}"
-  echo -e "  Token:                     ${G}${TOKEN}${N}"
+  echo -e "  Tunnel port:               ${G}${TUNNEL_PORT}${N}  (fixed, same in both scripts)"
+  echo -e "  Token:                     ${G}${TOKEN}${N}  (fixed, same in both scripts)"
   echo -e "  Protocol:                  ${G}${PROTO}${N}"
   echo -e "  Forward ports:             ${G}$(echo $ports | tr ' ' ',')${N}"
   if [ "$PROTO" = "noise" ]; then
@@ -491,7 +439,6 @@ setup_iran() {
     echo -e "  ${G}${NOISE_PUB}${N}"
   fi
   echo -e "${C}=================================================================${N}"
-  echo -e "${Y}Save the port and token above — you'll be asked for them when setting up the Kharej side.${N}"
   echo ""
   read -rp "Press Enter to return to the menu..."
 }
@@ -505,17 +452,6 @@ setup_kharej() {
   echo ""
   install_deps
   install_core || { read -rp "Press Enter to go back..."; return; }
-
-  # --- Tunnel port + token (must match the Iran server exactly) ---
-  echo ""
-  echo -e "${Y}Enter the tunnel port shown on the Iran server${N}"
-  read -rp "Tunnel port [${TUNNEL_PORT}]: " in_port
-  TUNNEL_PORT="${in_port:-$TUNNEL_PORT}"
-  echo -e "${Y}Enter the token shown on the Iran server${N}"
-  read -rp "Token: " in_token
-  if [ -n "$in_token" ]; then TOKEN="$in_token"; fi
-  if [ -z "$TOKEN" ]; then err "Token cannot be empty."; read -rp "Press Enter..."; return; fi
-  save_secrets
 
   # --- Number of Iran servers ---
   local count=1
@@ -557,8 +493,8 @@ setup_kharej() {
 
     # --- Build client.toml ---
     # heartbeat_timeout raised to 90s so normal network jitter doesn't get
-    # misread as a dead server and trigger a reconnect storm. retry_interval
-    # stays at 1s for a fast real reconnect when the link genuinely drops.
+    # misread as a dead server. retry_interval stays at 1s for a fast real
+    # reconnect when the link genuinely drops.
     local conf="$CONF_DIR/kharej-client-${i}.toml"
     [ -f "$conf" ] && cp -f "$conf" "${conf}.bak.$(date +%s)"
     {
@@ -582,13 +518,10 @@ setup_kharej() {
     summary="${summary}\n  Iran ${i}: ${G}${ip}${N} | Ports: ${G}$(echo $ports | tr ' ' ',')${N} -> destination ${G}${dest}${N}"
   done
 
-  # --- Watchdog ---
-  install_watchdog
-
   # --- Kernel/network stability tuning (automatic) ---
   apply_net_tuning
   apply_mss_clamp
-  ok "Kernel network tuning applied (BBR + keepalive + idle-recovery + MSS clamp)."
+  ok "Kernel network tuning applied (BBR + anti-bufferbloat + MSS clamp)."
 
   echo "kharej" > "$ROLE_FILE"
   {
@@ -607,7 +540,7 @@ setup_kharej() {
       ok "Connection to Iran server ${i} (${ip}:${TUNNEL_PORT}) is established ✔"
     else
       warn "Connection to ${ip}:${TUNNEL_PORT} is not yet established."
-      echo -e "    Check: 1) the script has been run on the Iran server 2) port ${TUNNEL_PORT} is open in the Iran server's firewall/datacenter 3) the token/protocol/key match on both sides."
+      echo -e "    Check: 1) the script has been run on the Iran server 2) port ${TUNNEL_PORT} is open in the Iran server's firewall/datacenter 3) the protocol/key match on both sides."
       echo -e "    Log: journalctl -u rathole-kharej-${i} -n 30 --no-pager"
     fi
   done
@@ -615,59 +548,9 @@ setup_kharej() {
   echo -e "$summary"
   echo ""
   echo -e "${Y}Important reminder:${N} run this same script on each Iran server, choose option \"1\", and"
-  echo -e "  enter the ${G}same port, token, and protocol (${PROTO})${N} so both sides of the tunnel match."
+  echo -e "  make sure the ${G}same protocol (${PROTO})${N} is chosen so both sides of the tunnel match."
   echo ""
   read -rp "Press Enter to return to the menu..."
-}
-
-# =============================================================================
-#  Automatic watchdog (every 30 seconds - on both servers)
-# =============================================================================
-install_watchdog() {
-  cat > "$WATCHDOG" <<'WDEOF'
-#!/bin/bash
-# Rathole Watchdog - checks service health and tunnel connection
-LOG=/var/log/rathole-watchdog.log
-TS="$(date '+%Y-%m-%d %H:%M:%S')"
-
-# 1) Any rathole service that is enabled but not running -> restart
-for unit in $(systemctl list-unit-files 2>/dev/null | grep -E '^rathole-(iran|kharej)-?[0-9]*\.service' | awk '{print $1}'); do
-  systemctl is-enabled --quiet "$unit" 2>/dev/null || continue
-  if ! systemctl is-active --quiet "$unit"; then
-    echo "$TS $unit was stopped; restarted" >> "$LOG"
-    systemctl reset-failed "$unit" 2>/dev/null
-    systemctl restart "$unit"
-  fi
-done
-
-# 2) Kharej side: check whether the TCP connection to each Iran server is up
-for f in /etc/rathole/kharej-client-*.toml; do
-  [ -e "$f" ] || continue
-  n=$(basename "$f" .toml | grep -o '[0-9]*$')
-  ip=$(grep remote_addr "$f" | head -n1 | cut -d'"' -f2 | cut -d: -f1)
-  pt=$(grep remote_addr "$f" | head -n1 | cut -d'"' -f2 | cut -d: -f2)
-  [ -z "$ip" ] && continue
-  if ! ss -tn state established 2>/dev/null | grep -q "${ip}:${pt}"; then
-    echo "$TS Connection to ${ip}:${pt} was down; restarting rathole-kharej-${n}" >> "$LOG"
-    systemctl reset-failed "rathole-kharej-${n}.service" 2>/dev/null
-    systemctl restart "rathole-kharej-${n}.service"
-  fi
-done
-
-# 3) Prevent the log from growing too large (keep last 500 lines)
-if [ -f "$LOG" ] && [ "$(wc -l < "$LOG")" -gt 1000 ]; then
-  tail -n 500 "$LOG" > "${LOG}.tmp" && mv "${LOG}.tmp" "$LOG"
-fi
-WDEOF
-  chmod +x "$WATCHDOG"
-  {
-    echo "* * * * * root ${WATCHDOG} >/dev/null 2>&1"
-    echo "* * * * * root sleep 30 && ${WATCHDOG} >/dev/null 2>&1"
-  } > "$CRON_FILE"
-  chmod 644 "$CRON_FILE"
-  systemctl restart cron  >/dev/null 2>&1
-  systemctl restart crond >/dev/null 2>&1
-  ok "Watchdog installed (automatic check every 30 seconds, self-heals failed units)."
 }
 
 # =============================================================================
@@ -694,11 +577,6 @@ show_status() {
   echo -e "${C}--- Listening ports ---${N}"
   ss -tln 2>/dev/null | grep -E ":(${TUNNEL_PORT})\b" || true
   echo ""
-  if [ -f "$LOG_FILE" ]; then
-    echo -e "${C}--- Latest watchdog events ---${N}"
-    tail -n 10 "$LOG_FILE"
-  fi
-  echo ""
   read -rp "Press Enter to return to the menu..."
 }
 
@@ -723,7 +601,7 @@ restart_all() {
 # =============================================================================
 optimize_net() {
   banner
-  info "Applying BBR, network optimization, and MSS clamp ..."
+  info "Applying BBR, anti-bufferbloat tuning, and MSS clamp ..."
   apply_net_tuning
   apply_mss_clamp
   if sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q bbr; then
@@ -794,7 +672,7 @@ uninstall_all() {
   rm -f /etc/systemd/system/rathole-mss-clamp.service
   iptables -t mangle -D OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null
   systemctl daemon-reload
-  rm -f "$WATCHDOG" "$CRON_FILE" "$ROLE_FILE" "$SECRETS_FILE"
+  rm -f "$ROLE_FILE"
   rm -rf "$CONF_DIR"
   rm -f "$BIN"
   rm -f /etc/sysctl.d/99-rathole-tune.conf
@@ -818,7 +696,7 @@ main_menu() {
     echo "  4) Restart tunnel"
     echo "  5) Network optimization (BBR + MSS clamp)"
     echo "  6) Edit ports"
-    echo "  7) Update rathole core to the latest version"
+    echo "  7) Reinstall rathole core (pinned stable version)"
     echo "  8) Fully remove tunnel"
     echo "  0) Exit"
     echo ""
@@ -839,5 +717,4 @@ main_menu() {
 }
 
 need_root
-load_or_init_secrets
 main_menu

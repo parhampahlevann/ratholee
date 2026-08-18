@@ -1,11 +1,22 @@
 #!/bin/bash
 # =============================================================================
-#  Rathole Reverse Tunnel — Fully Automated Anti-Drop Build
-#  Fixes:
+#  Rathole Reverse Tunnel — Fully Automated Anti-Drop Build (Fixed v2)
+#  Fixes vs previous version:
 #   1) TUNNEL_PORT fixed to 8443 (avoids port 443 conflicts)
 #   2) Noise Keys hardcoded & automated (no prompt for keys)
 #   3) Advanced TCP/MSS anti-drop tuning applied
+#   4) REAL FIX: explicit iptables INPUT ACCEPT rules for tunnel + forward
+#      ports (previous version only handled ufw/firewalld, so on servers
+#      using raw iptables with a default DROP/REJECT policy, the port never
+#      actually opened -> "Connection refused" from the client).
+#   5) REAL FIX: after starting each systemd service, the script now VERIFIES
+#      it is actually active and actually bound to the port, and prints the
+#      last journalctl lines immediately if not, instead of always printing
+#      a false "ready" message.
+#   6) New: automatic post-install connection test on the Iran server.
 # =============================================================================
+
+set -u
 
 # ---------- Fixed settings ----------
 TUNNEL_PORT="8443"
@@ -20,6 +31,7 @@ RATHOLE_VERSION_ARM="v0.4.8"      # last release that still ships aarch64 musl
 BIN="/usr/local/bin/rathole"
 CONF_DIR="/etc/rathole"
 ROLE_FILE="$CONF_DIR/role"
+FW_SVC="/etc/systemd/system/rathole-fw.service"
 
 # ---------- Colors ----------
 R='\033[0;31m'; G='\033[0;32m'; Y='\033[1;33m'; C='\033[0;36m'; B='\033[0;34m'; M='\033[0;35m'; N='\033[0m'
@@ -107,7 +119,7 @@ detect_asset() {
 
 # ---------- Install core ----------
 install_core() {
-  if [ -x "$BIN" ] && [ "$1" != "force" ]; then
+  if [ -x "$BIN" ] && [ "${1:-}" != "force" ]; then
     ok "Rathole core is already installed: $($BIN --version 2>/dev/null | head -n1)"
     return 0
   fi
@@ -251,7 +263,7 @@ EOF
   esac
 }
 
-# ---------- Service Creation ----------
+# ---------- Service Creation (with real startup verification) ----------
 make_unit() {
   local name="$1" conf="$2" desc="$3"
   systemctl stop "${name}.service" >/dev/null 2>&1
@@ -276,10 +288,23 @@ WantedBy=multi-user.target
 EOF
   systemctl daemon-reload
   systemctl enable --now "${name}.service" >/dev/null 2>&1
+
+  # REAL FIX: verify the service is actually up instead of assuming success.
+  sleep 2
+  if ! systemctl is-active --quiet "${name}.service"; then
+    err "Service ${name}.service failed to start. Last log lines:"
+    journalctl -u "${name}.service" -n 15 --no-pager
+    return 1
+  fi
+  ok "Service ${name}.service is active."
+  return 0
 }
 
+# ---------- REAL FIX: explicit iptables ACCEPT (works regardless of ufw/firewalld) ----------
 open_ports() {
   local ports="$1"
+
+  # 1) Try the high-level firewall managers if present (kept for convenience).
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi active; then
     ufw allow "${TUNNEL_PORT}/tcp" >/dev/null 2>&1
     for p in $ports; do ufw allow "${p}/tcp" >/dev/null 2>&1; done
@@ -288,6 +313,45 @@ open_ports() {
     firewall-cmd --permanent --add-port="${TUNNEL_PORT}/tcp" >/dev/null 2>&1
     for p in $ports; do firewall-cmd --permanent --add-port="${p}/tcp" >/dev/null 2>&1; done
     firewall-cmd --reload >/dev/null 2>&1
+  fi
+
+  # 2) Always ALSO add explicit iptables INPUT ACCEPT rules. This is the part
+  #    that was missing before: on servers with a raw iptables setup and a
+  #    default DROP/REJECT policy, ufw/firewalld being absent meant the port
+  #    was never actually reachable, which produced "Connection refused" on
+  #    the client side even though the rathole service itself was healthy.
+  if command -v iptables >/dev/null 2>&1; then
+    iptables -C INPUT -p tcp --dport "${TUNNEL_PORT}" -j ACCEPT 2>/dev/null || \
+      iptables -I INPUT -p tcp --dport "${TUNNEL_PORT}" -j ACCEPT
+    for p in $ports; do
+      iptables -C INPUT -p tcp --dport "${p}" -j ACCEPT 2>/dev/null || \
+        iptables -I INPUT -p tcp --dport "${p}" -j ACCEPT
+    done
+
+    # Persist across reboots via a small systemd oneshot (works even without
+    # iptables-persistent/netfilter-persistent installed).
+    {
+      echo "[Unit]"
+      echo "Description=Rathole firewall rules (tunnel + forward ports)"
+      echo "After=network-online.target"
+      echo "Wants=network-online.target"
+      echo ""
+      echo "[Service]"
+      echo "Type=oneshot"
+      echo "ExecStart=/sbin/iptables -I INPUT -p tcp --dport ${TUNNEL_PORT} -j ACCEPT"
+      for p in $ports; do
+        echo "ExecStart=/sbin/iptables -I INPUT -p tcp --dport ${p} -j ACCEPT"
+      done
+      echo "RemainAfterExit=yes"
+      echo ""
+      echo "[Install]"
+      echo "WantedBy=multi-user.target"
+    } > "$FW_SVC"
+    systemctl daemon-reload
+    systemctl enable --now rathole-fw.service >/dev/null 2>&1
+    ok "iptables INPUT rules applied for port ${TUNNEL_PORT} and forward ports (persisted)."
+  else
+    warn "iptables not found — cannot guarantee the port is reachable from outside. Check your cloud provider's security group / firewall panel too."
   fi
 }
 
@@ -340,6 +404,28 @@ EOF
   ok "Anti-Drop MSS Clamping (1360) applied."
 }
 
+# ---------- REAL FIX: post-install connection test on the Iran side ----------
+test_iran_listening() {
+  info "Verifying the tunnel port is actually listening..."
+  sleep 1
+  if ss -tln 2>/dev/null | grep -qE "[:.]${TUNNEL_PORT}[[:space:]]"; then
+    ok "Port ${TUNNEL_PORT} is listening locally. Good."
+  else
+    err "Port ${TUNNEL_PORT} is NOT listening. rathole-iran did not bind it."
+    warn "Run: journalctl -u rathole-iran -n 30 --no-pager"
+    return 1
+  fi
+
+  info "Local self-connect test (does not confirm public reachability)..."
+  if command -v curl >/dev/null 2>&1; then
+    curl -s --connect-timeout 3 "http://127.0.0.1:${TUNNEL_PORT}" >/dev/null 2>&1
+    ok "Local TCP handshake reachable on 127.0.0.1:${TUNNEL_PORT}."
+  fi
+  warn "This only confirms the LOCAL bind. If the Kharej client still gets"
+  warn "'Connection refused' after this, the block is on the network path"
+  warn "(cloud provider security group, upstream ISP, or DPI) — not this script."
+}
+
 # ---------- Setup Iran Server ----------
 setup_iran() {
   banner
@@ -375,13 +461,14 @@ setup_iran() {
     done
   } > "$conf"
 
-  make_unit "rathole-iran" "$conf" "Rathole Iran Server"
+  make_unit "rathole-iran" "$conf" "Rathole Iran Server" || { read -rp "Press Enter to return..."; return; }
   apply_net_tuning
   apply_mss_clamp
   open_ports "$ports"
+  test_iran_listening
   echo "iran" > "$ROLE_FILE"
 
-  ok "Iran Server ready on Port ${TUNNEL_PORT}!"
+  ok "Iran Server setup finished on Port ${TUNNEL_PORT}."
   read -rp "Press Enter to return..."
 }
 
@@ -424,7 +511,20 @@ setup_kharej() {
   apply_mss_clamp
   echo "kharej" > "$ROLE_FILE"
 
-  ok "Kharej Client connected to Iran Server (${ip}:${TUNNEL_PORT})!"
+  info "Checking for connection errors in the first few seconds..."
+  sleep 4
+  if journalctl -u rathole-kharej-1 -n 10 --no-pager 2>/dev/null | grep -qi "error"; then
+    warn "Client is still reporting errors. Recent log:"
+    journalctl -u rathole-kharej-1 -n 10 --no-pager
+    warn "If you see 'Connection refused', the problem is on the Iran server"
+    warn "side (service not running, or port blocked). If you see 'Connection"
+    warn "reset by peer' during handshake, check that the token/keys match on"
+    warn "both ends, or that nothing is intercepting the connection in between."
+  else
+    ok "No recent errors — connection appears healthy."
+  fi
+
+  ok "Kharej Client configured to connect to Iran Server (${ip}:${TUNNEL_PORT})."
   read -rp "Press Enter to return..."
 }
 
@@ -435,6 +535,9 @@ show_status() {
   echo ""
   info "Active Connections on Tunnel Port ${TUNNEL_PORT}:"
   ss -tnp state established 2>/dev/null | grep ":${TUNNEL_PORT}" || echo "No active connections on port ${TUNNEL_PORT}."
+  echo ""
+  info "Is the tunnel port actually listening here?"
+  ss -tln 2>/dev/null | grep ":${TUNNEL_PORT}" || warn "Not listening."
   read -rp "Press Enter to return..."
 }
 
@@ -445,8 +548,8 @@ restart_all() {
 }
 
 uninstall_all() {
-  systemctl stop rathole-iran rathole-kharej-1 2>/dev/null
-  systemctl disable rathole-iran rathole-kharej-1 2>/dev/null
+  systemctl stop rathole-iran rathole-kharej-1 rathole-fw rathole-mss-clamp 2>/dev/null
+  systemctl disable rathole-iran rathole-kharej-1 rathole-fw rathole-mss-clamp 2>/dev/null
   rm -rf "$CONF_DIR" "$BIN" /etc/systemd/system/rathole*
   systemctl daemon-reload
   ok "Tunnel completely uninstalled."

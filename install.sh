@@ -4,21 +4,26 @@
 #  Reverse architecture: Iran server = rathole server | Kharej (abroad) server = rathole client
 #  Fixed tunnel port + fixed token (no copy/paste needed) | Up to 3 Iran servers
 #
-#  STABILITY PATCH v3:
-#   - Fixed token & fixed tunnel port (38954) — no prompting, no copy/paste.
-#   - Watchdog removed entirely: it was force-restarting healthy connections
-#     during brief, normal TCP reconnect windows, causing extra drops.
-#     systemd's own Restart=always + StartLimitIntervalSec=0 is sufficient.
-#   - Anti-bufferbloat kernel tuning: much smaller socket buffers and NIC
-#     backlog than before — large buffers were queuing up and causing sudden
-#     ping spikes under load.
-#   - Rathole binary pinned to a known-stable release (v0.5.0) instead of
-#     always grabbing "latest", which can be a less-tested build.
+#  STABILITY PATCH v4:
+#   - Tunnel port fixed to 443. Data channels were being silently timed out
+#     (SYN dropped, not refused) on the old high port (e.g. 38409) while the
+#     very first control-channel connection went through fine — a classic
+#     signature of behavior-based active blocking targeting a specific
+#     IP:port pair after it's identified as tunnel-like traffic. Port 443
+#     is far less likely to be broadly blocked since it carries ordinary
+#     HTTPS traffic everywhere.
+#   - Fixed token & fixed tunnel port — no prompting, no copy/paste.
+#   - No watchdog (removed in v3): it was force-restarting healthy
+#     connections during brief, normal TCP reconnect windows.
+#     systemd's Restart=always + StartLimitIntervalSec=0 is sufficient.
+#   - Anti-bufferbloat kernel tuning (moderate buffers, small backlog).
+#   - Rathole binary pinned to v0.5.0 — this is in fact the latest official
+#     stable release upstream, not an older fallback.
 #   - MSS clamping kept (fixes PMTU-blackhole packet drops).
 # =============================================================================
 
 # ---------- Fixed settings ----------
-TUNNEL_PORT="38954"
+TUNNEL_PORT="443"
 TOKEN="rH7kQ2vXpL9mZ4wT6nB8sD3fG5jC1yA0"
 RATHOLE_VERSION="v0.5.0"
 BIN="/usr/local/bin/rathole"
@@ -79,7 +84,7 @@ detect_asset() {
   return 0
 }
 
-# ---------- Install/update rathole core (pinned to a stable release) ----------
+# ---------- Install/update rathole core (pinned to the latest stable release) ----------
 install_core() {
   if [ -x "$BIN" ] && [ "$1" != "force" ]; then
     ok "Rathole core is already installed: $($BIN --version 2>/dev/null | head -n1)"
@@ -135,6 +140,18 @@ parse_ports() {
     out="$out $p"
   done
   echo "${out# }"
+}
+
+# ---------- Warn / block if the tunnel port itself is already taken ----------
+# Port 443 is commonly used by a web server (nginx/apache), which would
+# conflict directly with rathole trying to bind the same port.
+check_tunnel_port_free() {
+  if ss -tln 2>/dev/null | grep -q ":${TUNNEL_PORT} "; then
+    warn "Port ${TUNNEL_PORT} is already in use on this server (likely a web server)."
+    echo -e "${Y}rathole needs this port exclusively. Stop whatever is using it, e.g.:${N}"
+    echo "    systemctl stop nginx    # or apache2, caddy, etc."
+    read -rp "Press Enter once port ${TUNNEL_PORT} is free (or Ctrl+C to abort)..."
+  fi
 }
 
 # ---------- Choose protocol ----------
@@ -274,10 +291,7 @@ open_ports() {
 
 # =============================================================================
 #  Stability tuning (kernel + BBR) — anti-bufferbloat version.
-#  Buffers/backlog were previously oversized (64MB / 250000), which queues
-#  up under load and causes exactly the "ping suddenly spikes" symptom.
-#  These are now moderate — enough for good throughput without the queue
-#  buildup. Called automatically from setup_iran / setup_kharej.
+#  Called automatically from setup_iran / setup_kharej.
 # =============================================================================
 apply_net_tuning() {
   cat > /etc/sysctl.d/99-rathole-tune.conf <<'EOF'
@@ -303,10 +317,7 @@ EOF
 }
 
 # =============================================================================
-#  MSS clamping — eliminates PMTU-blackhole packet drops. Very common cause
-#  of "random disconnects + bad throughput regardless of protocol" on
-#  Iran <-> abroad routes where ICMP fragmentation-needed is filtered
-#  somewhere along the path.
+#  MSS clamping — eliminates PMTU-blackhole packet drops.
 # =============================================================================
 apply_mss_clamp() {
   if ! command -v iptables >/dev/null 2>&1; then
@@ -345,10 +356,13 @@ setup_iran() {
   install_deps
   install_core || { read -rp "Press Enter to go back..."; return; }
 
+  # --- Make sure the tunnel port (443) isn't already taken ---
+  check_tunnel_port_free
+
   # --- Forward ports ---
   echo ""
   echo -e "${Y}Enter the ports you want to forward${N}"
-  echo -e "${C}(comma-separated - example: 22,80,443,2086,2053)${N}"
+  echo -e "${C}(comma-separated - example: 22,80,2086,2053)${N}"
   local ports=""
   while [ -z "$ports" ]; do
     read -rp "Ports: " raw_ports
@@ -480,7 +494,7 @@ setup_kharej() {
       err "Invalid IP address."
     done
 
-    echo -e "${C}Forward ports for this server (comma-separated - example: 22,80,443,2086):${N}"
+    echo -e "${C}Forward ports for this server (comma-separated - example: 22,80,2086):${N}"
     ports=""
     while [ -z "$ports" ]; do
       read -rp "Ports: " raw_ports
@@ -492,9 +506,6 @@ setup_kharej() {
     dest="${dest:-127.0.0.1}"
 
     # --- Build client.toml ---
-    # heartbeat_timeout raised to 90s so normal network jitter doesn't get
-    # misread as a dead server. retry_interval stays at 1s for a fast real
-    # reconnect when the link genuinely drops.
     local conf="$CONF_DIR/kharej-client-${i}.toml"
     [ -f "$conf" ] && cp -f "$conf" "${conf}.bak.$(date +%s)"
     {

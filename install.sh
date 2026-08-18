@@ -23,8 +23,15 @@ TUNNEL_PORT="8443"
 TOKEN="rH7kQ2vXpL9mZ4wT6nB8sD3fG5jC1yA0"
 
 # Fixed & Pre-generated Noise Keypair for zero-prompt setup
-NOISE_PRIV="a4b3c2d1e0f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3"
-NOISE_PUB="f5e4d3c2b1a0f9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a2f1e0d9c8b7a6f5e4"
+# IMPORTANT: rathole's noise transport requires base64-encoded X25519 keys
+# (as produced by `rathole --genkey x25519`), NOT hex. Feeding a hex string
+# here causes rathole-server to base64-decode it into 48 bytes instead of 32,
+# which crashes the process with a Rust panic in the snow noise library
+# ("range end index 48 out of range for slice of length 32") every single
+# time a client connects — this was the actual cause of the refused/reset
+# errors, not a firewall or timing issue.
+NOISE_PRIV="8bytOyfav+CIn6pEY+gCUSn6PpHJh7ADeHT55wmrTsE="
+NOISE_PUB="gHmg3PHFH9+CouNJfGV28I4JwS3Hm28F8Vl2vGraU3g="
 
 RATHOLE_VERSION="v0.5.0"          # latest stable release (x86_64)
 RATHOLE_VERSION_ARM="v0.4.8"      # last release that still ships aarch64 musl
@@ -290,13 +297,21 @@ EOF
   systemctl enable --now "${name}.service" >/dev/null 2>&1
 
   # REAL FIX: verify the service is actually up instead of assuming success.
-  sleep 2
+  # A crash-looping service (Restart=always, RestartSec=1) can look "active"
+  # at the exact instant we check even though it's panicking every second,
+  # so also scan recent logs for a panic/core-dump before declaring success.
+  sleep 3
   if ! systemctl is-active --quiet "${name}.service"; then
     err "Service ${name}.service failed to start. Last log lines:"
     journalctl -u "${name}.service" -n 15 --no-pager
     return 1
   fi
-  ok "Service ${name}.service is active."
+  if journalctl -u "${name}.service" -n 20 --no-pager 2>/dev/null | grep -qiE "panicked|core-dump|core_dump"; then
+    err "Service ${name}.service is crash-looping (panic detected). Last log lines:"
+    journalctl -u "${name}.service" -n 20 --no-pager
+    return 1
+  fi
+  ok "Service ${name}.service is active and stable."
   return 0
 }
 

@@ -39,13 +39,40 @@
 #
 #  Transport note: rathole's [x.transport.tcp] block (nodelay/keepalive)
 #  also applies to the noise transport, so it is written for BOTH modes.
+#
+#  ---------------------------------------------------------------------
+#  v4 changes (fixes the "connects fine, then drops completely after a
+#  few minutes and never comes back" report):
+#
+#  14) v0.5.0 (Oct 2023) is still rathole's latest official stable
+#      release - there is no newer stable build to "upgrade" to (only an
+#      unofficial nightly "dev-latest" build exists, not recommended for
+#      production). So a version bump alone changes nothing. What DID
+#      change: v0.5.0 shipped a websocket transport that v3 never
+#      exposed. It is now option 3 in the protocol menu. Because it
+#      frames the connection as WebSocket instead of raw TCP/Noise, it
+#      survives some kinds of mid-stream traffic-pattern blocking that
+#      raw TCP/Noise do not - worth trying if TCP/Noise keep getting cut.
+#  15) TOKEN and the Noise keypair were hardcoded shared defaults copied
+#      by every install of scripts like this one. Beyond the obvious
+#      impersonation risk, thousands of installs sharing the exact same
+#      token/key is itself a recognizable, blockable fingerprint on a
+#      network that actively filters traffic. v4 generates a random
+#      token per install by default (still shown to you to paste on the
+#      other side, same UX as the existing Noise-key flow).
+#  16) NEW: a "Watch live logs" menu option that tails the running
+#      service with timestamps and saves them to a file. A drop that
+#      "just happens" needs the actual rathole error line (timed out /
+#      reset / handshake failed) to diagnose further - this captures it
+#      the next time it happens instead of guessing blind.
+#  ---------------------------------------------------------------------
 # =============================================================================
 
 set -u
 
 # ---------- Fixed settings ----------
 TUNNEL_PORT="8443"
-TOKEN="rH7kQ2vXpL9mZ4wT6nB8sD3fG5jC1yA0"
+TOKEN="rH7kQ2vXpL9mZ4wT6nB8sD3fG5jC1yA0"   # fallback only - a random token is generated per install (see prepare_token_*)
 
 # Built-in Noise keypair (base64 X25519, 32 bytes) — works out of the box.
 # You may replace these, or let the installer generate a fresh pair.
@@ -71,7 +98,7 @@ info() { echo -e "${C}[*]${N} $1"; }
 banner() {
   clear
   echo -e "${C}=============================================================${N}"
-  echo -e "${G}   Rathole Reverse Tunnel — Stable Anti-Drop Build (v3)${N}"
+  echo -e "${G}   Rathole Reverse Tunnel — Stable Anti-Drop Build (v4)${N}"
   echo -e "${C}      IRAN (Server)  <<==  ${TUNNEL_PORT}  ==>>  KHAREJ (Client)${N}"
   echo -e "${C}=============================================================${N}"
   echo ""
@@ -253,12 +280,15 @@ check_forward_ports_free() {
 choose_proto() {
   echo ""
   echo -e "${Y}Choose transport protocol:${N}"
-  echo "  1) Noise (Recommended - encrypted, same speed class as TCP)"
-  echo "  2) TCP   (plain, slightly less CPU)"
+  echo "  1) Noise     (Recommended - encrypted, same speed class as TCP)"
+  echo "  2) TCP       (plain, slightly less CPU)"
+  echo "  3) WebSocket (looks like ordinary web traffic on the wire; try this"
+  echo "               if Noise/TCP keep getting cut after a few minutes)"
   echo ""
   read -rp "Choice [1]: " pc
   case "${pc:-1}" in
     2) PROTO="tcp" ;;
+    3) PROTO="websocket" ;;
     *) PROTO="noise" ;;
   esac
   ok "Selected protocol: $PROTO"
@@ -321,6 +351,57 @@ prepare_noise_client() {
   fi
 }
 
+# ---------- Token helpers ----------
+# The built-in TOKEN constant is shared by every install of this script.
+# On a network that actively fingerprints/blocks tunnel traffic, that
+# makes every install of it look identical - a random per-install token
+# removes that shared signature (and closes the impersonation risk of a
+# public, hardcoded secret). Reused on re-runs so an already-paired
+# Kharej side is not invalidated by re-running Iran setup.
+gen_token() {
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -hex 24
+  else
+    head -c 32 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 40
+  fi
+}
+
+prepare_token_server() {
+  local tfile="$CONF_DIR/token"
+  if [ -s "$tfile" ]; then
+    SRV_TOKEN="$(cat "$tfile")"
+    info "Reusing the existing tunnel token from a previous install."
+    return
+  fi
+  SRV_TOKEN="$TOKEN"
+  echo ""
+  read -rp "Generate a fresh random tunnel token? (recommended) [Y/n]: " gt
+  if [[ ! "${gt:-Y}" =~ ^[Nn]$ ]]; then
+    SRV_TOKEN="$(gen_token)"
+  fi
+  printf '%s' "$SRV_TOKEN" > "$tfile"
+  chmod 600 "$tfile"
+  echo ""
+  ok "Tunnel token ready."
+  echo -e "${Y}------------------------------------------------------------${N}"
+  echo -e "${Y}Token — enter this on the KHAREJ side when asked:${N}"
+  echo -e "${G}${SRV_TOKEN}${N}"
+  echo -e "${Y}(also saved to ${tfile})${N}"
+  echo -e "${Y}------------------------------------------------------------${N}"
+}
+
+prepare_token_client() {
+  CLI_TOKEN="$TOKEN"
+  echo ""
+  read -rp "Tunnel token from the Iran side [Enter = built-in default]: " tk
+  if [ -n "$tk" ]; then
+    CLI_TOKEN="$tk"
+    ok "Custom token accepted."
+  else
+    warn "Using the built-in default token — only safe for a quick test."
+  fi
+}
+
 # ---------- Transport blocks ----------
 # NOTE: rathole applies [x.transport.tcp] options to noise/tls as well,
 # so the tcp block is always written, whatever the chosen protocol.
@@ -341,6 +422,12 @@ EOF
 pattern = "Noise_NK_25519_ChaChaPoly_BLAKE2s"
 local_private_key = "${SRV_PRIV}"
 EOF
+  elif [ "$PROTO" = "websocket" ]; then
+    cat <<EOF
+
+[server.transport.websocket]
+tls = false
+EOF
   fi
 }
 
@@ -360,6 +447,12 @@ EOF
 [client.transport.noise]
 pattern = "Noise_NK_25519_ChaChaPoly_BLAKE2s"
 remote_public_key = "${CLI_PUB}"
+EOF
+  elif [ "$PROTO" = "websocket" ]; then
+    cat <<EOF
+
+[client.transport.websocket]
+tls = false
 EOF
   fi
 }
@@ -659,6 +752,7 @@ setup_iran() {
   choose_proto
   SRV_PRIV="$NOISE_PRIV"
   [ "$PROTO" = "noise" ] && prepare_noise_server
+  prepare_token_server
 
   # remember port list (used to clean old firewall rules on re-install/uninstall)
   [ -f "$CONF_DIR/ports" ] && cp "$CONF_DIR/ports" "$CONF_DIR/ports.prev"
@@ -668,7 +762,7 @@ setup_iran() {
   {
     echo "[server]"
     echo "bind_addr = \"0.0.0.0:${TUNNEL_PORT}\""
-    echo "default_token = \"${TOKEN}\""
+    echo "default_token = \"${SRV_TOKEN}\""
     echo "heartbeat_interval = 10"
     echo ""
     transport_server_block
@@ -710,6 +804,7 @@ setup_kharej() {
   choose_proto
   CLI_PUB="$NOISE_PUB"
   [ "$PROTO" = "noise" ] && prepare_noise_client
+  prepare_token_client
 
   local ip=""
   while [ -z "$ip" ]; do
@@ -727,7 +822,7 @@ setup_kharej() {
   {
     echo "[client]"
     echo "remote_addr = \"${ip}:${TUNNEL_PORT}\""
-    echo "default_token = \"${TOKEN}\""
+    echo "default_token = \"${CLI_TOKEN}\""
     echo "retry_interval = 1"
     echo "heartbeat_timeout = 40"
     echo ""
@@ -796,6 +891,24 @@ restart_all() {
   sleep 2
 }
 
+# ---------- Live diagnostics (capture the real error at the moment of a drop) ----------
+watch_logs() {
+  banner
+  local role unit
+  role="$(cat "$ROLE_FILE" 2>/dev/null || echo '?')"
+  case "$role" in
+    iran)   unit="rathole-iran" ;;
+    kharej) unit="rathole-kharej-1" ;;
+    *) err "No role configured yet (install Iran or Kharej first)."; read -rp "Press Enter to return..."; return ;;
+  esac
+  local out="/root/rathole-diagnostic-$(date +%Y%m%d-%H%M%S).log"
+  info "Live-tailing ${unit}.service — leave this open until the tunnel drops,"
+  info "then press Ctrl+C. This does NOT restart or touch the service."
+  info "A copy is also being saved to: ${out}"
+  echo ""
+  journalctl -u "${unit}.service" -f -o short-iso | tee -a "$out"
+}
+
 # ---------- Full uninstall (leaves nothing behind) ----------
 uninstall_all() {
   local IPT; IPT="$(command -v iptables 2>/dev/null || true)"
@@ -832,6 +945,7 @@ main_menu() {
     echo " 3) Status & Connection Test"
     echo " 4) Restart Tunnel Services"
     echo " 5) Fully Remove Tunnel"
+    echo " 6) Watch Live Logs (use this to catch the exact error on the next drop)"
     echo " 0) Exit"
     echo ""
     read -rp "Choice: " ch
@@ -841,6 +955,7 @@ main_menu() {
       3) show_status ;;
       4) restart_all ;;
       5) uninstall_all ;;
+      6) watch_logs ;;
       0) exit 0 ;;
       *) warn "Invalid choice."; sleep 1 ;;
     esac

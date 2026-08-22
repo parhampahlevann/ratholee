@@ -1,28 +1,28 @@
 #!/bin/bash
 # =============================================================================
-#  Rathole Reverse Tunnel — Ultra-Stable Build (v6, Zero-Prompt & Aggressive Guard)
+#  Rathole Reverse Tunnel — Ultra-Stable Build (v7, WebSocket Fixed)
 #
-#  v6 Changes:
-#  1) WebSocket connectivity fixed + smart port 443/80 suggestion for DPI bypass.
-#  2) Aggressive Watchdog: Checks every 10s, parses logs for critical errors, 
-#     and force-restarts immediately if the connection is wedged or dropped.
-#  3) ZERO PROMPTS: Fixed Token (e8c94f...) and valid Base64 Noise keys are 
-#     hardcoded. You can configure multiple ports (e.g., 1080,80,443) instantly.
-#  4) Enhanced sysctl: Larger TCP buffers (128MB), optimized BBR, and FastOpen.
-#  5) Bug fixes: Safer port regex, instant systemd RestartSec=1, cleaner uninstall.
+#  v7 Changes:
+#  1) FIXED WebSocket connectivity: Removed invalid [transport.tcp] blocks 
+#     from websocket configs that were causing silent connection failures.
+#  2) Smart Default Ports: Automatically uses 1080,443,23902,2053,8090 if 
+#     you just press Enter during port selection.
+#  3) Watchdog Verification: Confirms timer activation after install.
+#  4) Hardcoded Token/Keys: Zero-prompt setup as requested.
 # =============================================================================
 
 set -u
 
 # ---------- Fixed settings (NO PROMPTS) ----------
 TUNNEL_PORT="8443"
-# Fixed token as requested (works perfectly as rathole default_token)
 TOKEN="e8c94f6a4e5ef135d7061fe365a686c070c1d1cd7337d8f6"
 
-# Fixed valid base64 X25519 Noise keypair (32 bytes). 
-# DO NOT change to hex; rathole strictly requires base64 for Noise keys.
+# Fixed valid base64 X25519 Noise keypair
 NOISE_PRIV="8bytOyfav+CIn6pEY+gCUSn6PpHJh7ADeHT55wmrTsE="
 NOISE_PUB="gHmg3PHFH9+CouNJfGV28I4JwS3Hm28F8Vl2vGraU3g="
+
+# Default forward ports (used if user just presses Enter)
+DEFAULT_PORTS="1080,443,23902,2053,8090"
 
 RATHOLE_VERSION="v0.5.0"
 RATHOLE_VERSION_MUSL="v0.4.8"
@@ -43,7 +43,7 @@ info() { echo -e "${C}[*]${N} $1"; }
 banner() {
   clear
   echo -e "${C}=============================================================${N}"
-  echo -e "${G}   Rathole Reverse Tunnel — Ultra-Stable Anti-Drop (v6)${N}"
+  echo -e "${G}   Rathole Reverse Tunnel — Ultra-Stable (v7, WS Fixed)${N}"
   echo -e "${C}      IRAN (Server)  <<==  ${TUNNEL_PORT}  ==>>  KHAREJ (Client)${N}"
   echo -e "${C}=============================================================${N}"
   echo ""
@@ -208,7 +208,7 @@ choose_proto() {
   echo -e "${Y}Choose transport protocol:${N}"
   echo "  1) Noise     (Recommended - encrypted, same speed class as TCP)"
   echo "  2) TCP       (plain, slightly less CPU)"
-  echo "  3) WebSocket (Looks like ordinary web traffic. Try this if others get cut)"
+  echo "  3) WebSocket (Try this if others get cut by DPI. Fixed in v7!)"
   echo ""
   read -rp "Choice [1]: " pc
   case "${pc:-1}" in
@@ -218,26 +218,35 @@ choose_proto() {
   esac
   ok "Selected protocol: $PROTO"
   
-  if [ "$PROTO" = "websocket" ] && [ "$TUNNEL_PORT" != "443" ] && [ "$TUNNEL_PORT" != "80" ]; then
-    warn "WebSocket works best on port 80 or 443 to bypass strict DPI."
-    read -rp "Change tunnel port to 443 for better WebSocket compatibility? [Y/n]: " change_port
-    if [[ ! "${change_port:-Y}" =~ ^[Nn]$ ]]; then
-      TUNNEL_PORT="443"
-      ok "Tunnel port changed to 443."
+  if [ "$PROTO" = "websocket" ]; then
+    warn "WebSocket works best on port 80 or 443 for direct IP connections."
+    warn "Note: Rathole v0.5.0 does NOT support TLS/WebSocket over CDN (like Cloudflare) natively."
+    if [ "$TUNNEL_PORT" != "443" ] && [ "$TUNNEL_PORT" != "80" ]; then
+      read -rp "Change tunnel port to 443 for better WebSocket compatibility? [Y/n]: " change_port
+      if [[ ! "${change_port:-Y}" =~ ^[Nn]$ ]]; then
+        TUNNEL_PORT="443"
+        ok "Tunnel port changed to 443."
+      fi
     fi
   fi
 }
 
+# FIXED: Only include [transport.tcp] for TCP and Noise protocols.
+# Including it for WebSocket causes config parsing errors in rathole.
 transport_server_block() {
   cat <<EOF
 [server.transport]
 type = "${PROTO}"
+EOF
+  if [ "$PROTO" = "tcp" ] || [ "$PROTO" = "noise" ]; then
+    cat <<EOF
 
 [server.transport.tcp]
 nodelay = true
 keepalive_secs = 20
 keepalive_interval = 8
 EOF
+  fi
   if [ "$PROTO" = "noise" ]; then
     cat <<EOF
 
@@ -258,12 +267,16 @@ transport_client_block() {
   cat <<EOF
 [client.transport]
 type = "${PROTO}"
+EOF
+  if [ "$PROTO" = "tcp" ] || [ "$PROTO" = "noise" ]; then
+    cat <<EOF
 
 [client.transport.tcp]
 nodelay = true
 keepalive_secs = 20
 keepalive_interval = 8
 EOF
+  fi
   if [ "$PROTO" = "noise" ]; then
     cat <<EOF
 
@@ -432,7 +445,7 @@ EOF
 install_guard() {
   cat > /usr/local/bin/rathole-guard.sh <<EOF
 #!/bin/bash
-# rathole aggressive self-healing guard (v6)
+# rathole aggressive self-healing guard (v7)
 PORT="${TUNNEL_PORT}"
 ROLE="\$(cat /etc/rathole/role 2>/dev/null)"
 UNIT=""
@@ -493,6 +506,10 @@ EOF
   systemctl daemon-reload
   systemctl enable --now rathole-guard.timer >/dev/null 2>&1
   ok "Aggressive guard installed (checks every 10s, instant restart on drop/error)."
+  
+  # Verification output
+  echo -e "${C}[*]${N} Verifying watchdog timer status:"
+  systemctl list-timers rathole-guard.timer --no-pager | grep rathole-guard || warn "Timer not found!"
 }
 
 setup_iran() {
@@ -506,11 +523,14 @@ setup_iran() {
   check_tunnel_port_free || { read -rp "Press Enter to return..."; return; }
 
   local ports="" raw_ports
-  while [ -z "$ports" ]; do
-    echo -e "${Y}Tip: You can enter multiple ports separated by commas (e.g., 1080,80,443) to create 3 tunnels in one connection.${N}"
-    read -rp "Enter Forward Ports: " raw_ports
-    ports=$(parse_ports "$raw_ports")
-  done
+  echo ""
+  echo -e "${Y}Tip: You can enter multiple ports separated by commas.${N}"
+  echo -e "${C}Default ports if you press Enter: ${DEFAULT_PORTS}${N}"
+  read -rp "Enter Forward Ports [Press Enter for defaults]: " raw_ports
+  
+  # Use default if empty
+  raw_ports="${raw_ports:-$DEFAULT_PORTS}"
+  ports=$(parse_ports "$raw_ports")
 
   check_forward_ports_free "$ports" || { read -rp "Press Enter to return..."; return; }
   choose_proto
@@ -567,10 +587,14 @@ setup_kharej() {
   done
 
   local ports="" raw_ports
-  while [ -z "$ports" ]; do
-    read -rp "Enter Forward Ports (MUST match Iran side, e.g., 1080,80,443): " raw_ports
-    ports=$(parse_ports "$raw_ports")
-  done
+  echo ""
+  echo -e "${Y}Tip: These ports MUST match the Iran side exactly.${N}"
+  echo -e "${C}Default ports if you press Enter: ${DEFAULT_PORTS}${N}"
+  read -rp "Enter Forward Ports [Press Enter for defaults]: " raw_ports
+  
+  # Use default if empty
+  raw_ports="${raw_ports:-$DEFAULT_PORTS}"
+  ports=$(parse_ports "$raw_ports")
 
   local conf="$CONF_DIR/kharej-client-1.toml"
   {
@@ -620,6 +644,9 @@ show_status() {
   info "Role: ${role}    Protocol: ${proto}    Tunnel port: ${TUNNEL_PORT}"
   echo ""
   systemctl status rathole-iran rathole-kharej-1 --no-pager 2>/dev/null | head -n 20
+  echo ""
+  info "Watchdog Timer Status:"
+  systemctl list-timers rathole-guard.timer --no-pager | grep rathole-guard || echo "Not active"
   echo ""
   info "Established tunnel connections on port ${TUNNEL_PORT}:"
   ss -tn state established 2>/dev/null | grep ":${TUNNEL_PORT}" || echo "none"

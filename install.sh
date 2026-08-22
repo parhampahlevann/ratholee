@@ -368,17 +368,26 @@ prepare_noise_server() {
 }
 
 prepare_noise_client() {
-  CLI_PUB="$NOISE_PUB"
+  local kfile="$CONF_DIR/client-noise-pubkey" saved=""
+  [ -s "$kfile" ] && saved="$(cat "$kfile")"
+  CLI_PUB="${saved:-$NOISE_PUB}"
   echo ""
-  read -rp "Remote (Iran) Noise public key [Enter = built-in default]: " rpk
+  if [ -n "$saved" ]; then
+    read -rp "Remote (Iran) Noise public key [Enter = reuse saved key]: " rpk
+  else
+    read -rp "Remote (Iran) Noise public key [Enter = built-in default]: " rpk
+  fi
   if [ -n "$rpk" ]; then
     if [ "$(b64_len "$rpk")" = "32" ]; then
       CLI_PUB="$rpk"
       ok "Custom public key accepted."
     else
-      warn "Invalid key (not a 32-byte base64 key) — using built-in default."
+      warn "Invalid key (not a 32-byte base64 key) — keeping the previous value."
     fi
   fi
+  mkdir -p "$CONF_DIR"
+  printf '%s' "$CLI_PUB" > "$kfile"
+  chmod 600 "$kfile"
 }
 
 # ---------- Token helpers ----------
@@ -421,15 +430,26 @@ prepare_token_server() {
 }
 
 prepare_token_client() {
-  CLI_TOKEN="$TOKEN"
+  local tfile="$CONF_DIR/client-token" saved=""
+  [ -s "$tfile" ] && saved="$(cat "$tfile")"
+  CLI_TOKEN="${saved:-$TOKEN}"
   echo ""
-  read -rp "Tunnel token from the Iran side [Enter = built-in default]: " tk
+  if [ -n "$saved" ]; then
+    read -rp "Tunnel token from the Iran side [Enter = reuse saved token]: " tk
+  else
+    read -rp "Tunnel token from the Iran side [Enter = built-in default]: " tk
+  fi
   if [ -n "$tk" ]; then
     CLI_TOKEN="$tk"
     ok "Custom token accepted."
-  else
+  elif [ -z "$saved" ]; then
     warn "Using the built-in default token — only safe for a quick test."
+  else
+    info "Reusing the previously saved tunnel token."
   fi
+  mkdir -p "$CONF_DIR"
+  printf '%s' "$CLI_TOKEN" > "$tfile"
+  chmod 600 "$tfile"
 }
 
 # ---------- Transport blocks ----------
@@ -1059,18 +1079,34 @@ restart_all() {
 # Prints a one-line plain-English interpretation right under a log line
 # that matches a known rathole/tunnel failure pattern. Pure pattern
 # matching on text already in the log - never restarts or touches anything.
+# $2 is the role ("iran" or "kharej") this log belongs to: the SAME
+# message means different things on each side. On the server, a failed
+# handshake comes from an unauthenticated inbound connection - anyone on
+# the internet can trigger one, so it's usually background scanning
+# noise, not proof your own Kharej link is broken. On the client, the
+# same message is specifically about your own connection to your own
+# server, so it IS about your link.
 annotate_log_line() {
-  case "$1" in
+  local line="$1" role="${2:-}"
+  case "$line" in
     *"Failed to run the data channel"*"timed out"*|*"Failed to run the data channel"*"Connection timed out"*)
       warn "  -> A NEW tunnel connection got no reply at all (not refused, not reset - pure silence). The control channel is still fine; something on the path is dropping SYNs to this IP:port specifically for new connections. Try protocol 3 (WebSocket), or a different tunnel port (e.g. 443)." ;;
-    *"timed out"*|*"deadline has elapsed"*)
-      warn "  -> Timeout: a heartbeat or handshake step never got a reply. Usually a mid-path drop or DPI throttling. Try protocol 3 (WebSocket)." ;;
+    *"Transport handshake timeout"*|*"deadline has elapsed"*)
+      if [ "$role" = "iran" ]; then
+        warn "  -> An inbound connection never completed its handshake. On a public port this is usually internet scanning noise (or active DPI probing) - anyone can trigger this, not just your Kharej client. Only worth chasing if it lines up with a drop the Kharej side also shows at the same second."
+      else
+        warn "  -> Timeout: your handshake to the Iran server never got a reply. Usually a mid-path drop or DPI throttling. Try protocol 3 (WebSocket)."
+      fi ;;
+    *"Failed to do noise handshake"*|*"Snow error"*)
+      if [ "$role" = "iran" ]; then
+        warn "  -> An inbound connection sent an invalid/undecryptable handshake. On a public port this is almost always an unrelated scanner or bot, NOT your own Kharej client - its key pair already proved itself working when its control channel established. Only worth chasing if it lines up with a Kharej-side drop at the same second."
+      else
+        warn "  -> Noise handshake problem: the local/remote key pair on the two sides don't match."
+      fi ;;
     *"reset by peer"*|*"Connection reset"*)
       warn "  -> Reset: token/key mismatch, a protocol mismatch between the two sides, or an active reset on the path." ;;
     *"Connection refused"*)
       warn "  -> Refused: the other side is down, or the port is blocked before it reaches rathole." ;;
-    *"Noise"*[Ff]"ail"*|*"handshake"*[Ff]"ail"*)
-      warn "  -> Noise handshake problem: the local/remote key pair on the two sides don't match." ;;
   esac
 }
 
@@ -1091,7 +1127,7 @@ watch_logs() {
   echo ""
   journalctl -u "${unit}.service" -f -o short-iso | while IFS= read -r line; do
     echo "$line" | tee -a "$out"
-    annotate_log_line "$line"
+    annotate_log_line "$line" "$role"
   done
 }
 

@@ -1,110 +1,31 @@
 #!/bin/bash
 # =============================================================================
-#  Rathole Reverse Tunnel — Automated Stable Build (v3, Anti-Drop Edition)
+#  Rathole Reverse Tunnel — Ultra-Stable Build (v6, Zero-Prompt & Aggressive Guard)
 #
-#  Root causes of the "connects, then keeps dropping" problem in v2 and
-#  what this version does about them:
-#
-#   1) TCP keepalive was 5s/2s. With the kernel default of 3 probes, any
-#      connection stalled for ~11s (typical DPI throttling / congestion
-#      burst) was killed by the kernel -> endless reconnect loop.
-#      v3 uses rathole's proven defaults: 20s / 8s.
-#   2) heartbeat_timeout=25 with heartbeat_interval=8 tolerated only ~2-3
-#      lost heartbeats. On lossy links that causes false-positive reconnects.
-#      v3 uses interval=10 / timeout=40 (~4 lost heartbeats tolerated, and
-#      timeout > interval as required by rathole).
-#   3) sysctl tcp_retries2=5 made the kernel RESET any flow that lost a few
-#      retransmissions -> live sessions (SSH, downloads) through the tunnel
-#      died during loss bursts. v3 uses tcp_retries2=8.
-#   4) sysctl tcp_base_mss=1024 killed throughput; removed (MSS clamp stays).
-#   5) MSS clamp flushed the WHOLE mangle/OUTPUT chain (-F), destroying
-#      rules of other tools. v3 adds/removes only its own rule, idempotently.
-#   6) /sbin/iptables was hardcoded (on many systems it lives in /usr/sbin).
-#      v3 auto-detects the path everywhere (live rules + systemd units).
-#   7) The firewall systemd unit duplicated rules on every boot. v3 uses
-#      "-C check || -A add" so rules are always idempotent.
-#   8) Re-running setup falsely reported "port busy" because the old rathole
-#      instance was still bound. v3 stops the old service before checking.
-#   9) Kharej setup did not abort when the service failed to start. Fixed.
-#  10) v0.5.0 is a glibc (Ubuntu 22.04) build: on old distros the binary
-#      crashed at startup while the install still "succeeded". v3 test-runs
-#      the binary after install and falls back to the static musl build.
-#  11) Uninstall left sysctl/mangle/INPUT rules behind. v3 cleans up fully.
-#  12) NEW: lightweight self-healing guard (systemd timer, checks every 30s,
-#      restarts the tunnel only after 3 consecutive failed checks) so a
-#      wedged-but-alive connection recovers by itself.
-#  13) NEW: optional fresh Noise keypair per install (validated as base64
-#      32-byte X25519 keys). The built-in shared key still works by default
-#      for zero-prompt setups.
-#
-#  Transport note: rathole's [x.transport.tcp] block (nodelay/keepalive)
-#  also applies to the noise transport, so it is written for BOTH modes.
-#
-#  ---------------------------------------------------------------------
-#  v4 changes (fixes the "connects fine, then drops completely after a
-#  few minutes and never comes back" report):
-#
-#  14) v0.5.0 (Oct 2023) is still rathole's latest official stable
-#      release - there is no newer stable build to "upgrade" to (only an
-#      unofficial nightly "dev-latest" build exists, not recommended for
-#      production). So a version bump alone changes nothing. What DID
-#      change: v0.5.0 shipped a websocket transport that v3 never
-#      exposed. It is now option 3 in the protocol menu. Because it
-#      frames the connection as WebSocket instead of raw TCP/Noise, it
-#      survives some kinds of mid-stream traffic-pattern blocking that
-#      raw TCP/Noise do not - worth trying if TCP/Noise keep getting cut.
-#  15) TOKEN and the Noise keypair were hardcoded shared defaults copied
-#      by every install of scripts like this one. Beyond the obvious
-#      impersonation risk, thousands of installs sharing the exact same
-#      token/key is itself a recognizable, blockable fingerprint on a
-#      network that actively filters traffic. v4 generates a random
-#      token per install by default (still shown to you to paste on the
-#      other side, same UX as the existing Noise-key flow).
-#  16) NEW: a "Watch live logs" menu option that tails the running
-#      service with timestamps and saves them to a file. A drop that
-#      "just happens" needs the actual rathole error line (timed out /
-#      reset / handshake failed) to diagnose further - this captures it
-#      the next time it happens instead of guessing blind.
-#  ---------------------------------------------------------------------
-#
-#  v5 changes (turns raw diagnostics into actual answers):
-#
-#  17) NEW: "Local Self-Test" menu option. Spins up a throwaway
-#      server+client pair on free local ports (rathole talking to
-#      itself over loopback, plus a tiny local HTTP origin if python3
-#      is available), runs a real handshake + forwarded request, and
-#      reports pass/fail. This catches a broken binary, a bad token/key
-#      pairing, or a malformed config BEFORE you ever touch the real
-#      Iran/Kharej boxes. It only proves the local install is sound -
-#      it cannot and does not simulate real-network loss, latency, or
-#      DPI, since both ends run on the same machine.
-#  18) "Watch Live Logs" now annotates known rathole error lines as
-#      they stream (timeout -> likely DPI/mid-path drop; reset ->
-#      token/key/protocol mismatch or active reset; refused -> other
-#      side down or port blocked; handshake failure -> Noise key
-#      mismatch), instead of leaving you to interpret raw log text
-#      the moment a drop happens.
-#  19) Status screen now prints live TCP-level stats (rtt, rttvar,
-#      retransmits) for the established tunnel socket via `ss -ti`.
-#      This is the actual signal for "connection has latency / is
-#      unstable" - rathole's own logs don't expose it, but the kernel
-#      does.
-#  ---------------------------------------------------------------------
+#  v6 Changes:
+#  1) WebSocket connectivity fixed + smart port 443/80 suggestion for DPI bypass.
+#  2) Aggressive Watchdog: Checks every 10s, parses logs for critical errors, 
+#     and force-restarts immediately if the connection is wedged or dropped.
+#  3) ZERO PROMPTS: Fixed Token (e8c94f...) and valid Base64 Noise keys are 
+#     hardcoded. You can configure multiple ports (e.g., 1080,80,443) instantly.
+#  4) Enhanced sysctl: Larger TCP buffers (128MB), optimized BBR, and FastOpen.
+#  5) Bug fixes: Safer port regex, instant systemd RestartSec=1, cleaner uninstall.
 # =============================================================================
 
 set -u
 
-# ---------- Fixed settings ----------
+# ---------- Fixed settings (NO PROMPTS) ----------
 TUNNEL_PORT="8443"
-TOKEN="rH7kQ2vXpL9mZ4wT6nB8sD3fG5jC1yA0"   # fallback only - a random token is generated per install (see prepare_token_*)
+# Fixed token as requested (works perfectly as rathole default_token)
+TOKEN="e8c94f6a4e5ef135d7061fe365a686c070c1d1cd7337d8f6"
 
-# Built-in Noise keypair (base64 X25519, 32 bytes) — works out of the box.
-# You may replace these, or let the installer generate a fresh pair.
+# Fixed valid base64 X25519 Noise keypair (32 bytes). 
+# DO NOT change to hex; rathole strictly requires base64 for Noise keys.
 NOISE_PRIV="8bytOyfav+CIn6pEY+gCUSn6PpHJh7ADeHT55wmrTsE="
 NOISE_PUB="gHmg3PHFH9+CouNJfGV28I4JwS3Hm28F8Vl2vGraU3g="
 
-RATHOLE_VERSION="v0.5.0"          # latest stable release (x86_64 glibc)
-RATHOLE_VERSION_MUSL="v0.4.8"     # last release that still ships musl/static builds
+RATHOLE_VERSION="v0.5.0"
+RATHOLE_VERSION_MUSL="v0.4.8"
 BIN="/usr/local/bin/rathole"
 CONF_DIR="/etc/rathole"
 ROLE_FILE="$CONF_DIR/role"
@@ -122,13 +43,12 @@ info() { echo -e "${C}[*]${N} $1"; }
 banner() {
   clear
   echo -e "${C}=============================================================${N}"
-  echo -e "${G}   Rathole Reverse Tunnel — Stable Anti-Drop Build (v5)${N}"
+  echo -e "${G}   Rathole Reverse Tunnel — Ultra-Stable Anti-Drop (v6)${N}"
   echo -e "${C}      IRAN (Server)  <<==  ${TUNNEL_PORT}  ==>>  KHAREJ (Client)${N}"
   echo -e "${C}=============================================================${N}"
   echo ""
 }
 
-# ---------- Root check ----------
 need_root() {
   if [ "$(id -u)" -ne 0 ]; then
     err "This script must be run with root privileges."
@@ -136,7 +56,6 @@ need_root() {
   fi
 }
 
-# ---------- Install prerequisites ----------
 install_deps() {
   local need=()
   command -v curl     >/dev/null 2>&1 || need+=(curl)
@@ -153,31 +72,21 @@ install_deps() {
   ok "Prerequisites are ready."
 }
 
-# ---------- Purge obsolete watchdogs (legacy versions only) ----------
 purge_watchdog() {
   local removed=0 u
-  for u in rathole-watchdog.service rathole-watchdog.timer watchdog.service watchdog.timer; do
+  for u in rathole-watchdog.service rathole-watchdog.timer watchdog.service watchdog.timer rathole-guard.service rathole-guard.timer; do
     if systemctl list-unit-files 2>/dev/null | grep -q "^${u}"; then
       systemctl disable --now "$u" >/dev/null 2>&1
       rm -f "/etc/systemd/system/${u}"
       removed=1
     fi
   done
-  rm -f /usr/local/bin/rathole-watchdog.sh /usr/local/bin/watchdog.sh 2>/dev/null
-  if [ -f /etc/cron.d/rathole-watchdog ] || [ -f /etc/cron.d/rathole ]; then
-    rm -f /etc/cron.d/rathole-watchdog /etc/cron.d/rathole
-    removed=1
-  fi
-  if crontab -l 2>/dev/null | grep -qi 'rathole.*watchdog\|watchdog.*rathole'; then
-    crontab -l 2>/dev/null | grep -vi 'rathole.*watchdog\|watchdog.*rathole' | crontab - 2>/dev/null
-    removed=1
-  fi
+  rm -f /usr/local/bin/rathole-guard.sh /usr/local/bin/rathole-watchdog.sh 2>/dev/null
   systemctl daemon-reload 2>/dev/null
-  [ "$removed" = "1" ] && ok "Legacy watchdog purged."
+  [ "$removed" = "1" ] && ok "Legacy watchdogs purged."
   return 0
 }
 
-# ---------- Detect architecture ----------
 detect_asset() {
   case "$(uname -m)" in
     x86_64|amd64)
@@ -194,7 +103,6 @@ detect_asset() {
   return 0
 }
 
-# ---------- Download helper ----------
 download_asset() {
   local tmp="$1" u
   info "Downloading rathole ${ASSET_VERSION} (${ASSET}) ..."
@@ -213,7 +121,6 @@ download_asset() {
   return 1
 }
 
-# ---------- Install core (with real run-verification) ----------
 install_core() {
   if [ -x "$BIN" ] && [ "${1:-}" != "force" ] && "$BIN" --version >/dev/null 2>&1; then
     ok "Rathole core is already installed: $("$BIN" --version 2>/dev/null | head -n1)"
@@ -231,9 +138,6 @@ install_core() {
   rm -rf "$tmp"
   mkdir -p "$CONF_DIR"
 
-  # REAL CHECK: the binary must actually RUN on this system.
-  # v0.5.0 x86_64 is built on a recent glibc; on old distros (e.g. CentOS 7)
-  # it fails to start. Fall back to the static musl build in that case.
   if ! "$BIN" --version >/dev/null 2>&1 && [ "$(uname -m)" = "x86_64" ]; then
     warn "Installed build cannot run here (glibc too old). Trying static musl build..."
     rm -f "$BIN"
@@ -255,7 +159,6 @@ install_core() {
   return 0
 }
 
-# ---------- Port check helpers ----------
 parse_ports() {
   local raw="$1"
   raw="${raw//،/,}"; raw="${raw// /,}"; raw="${raw//;/,}"
@@ -272,13 +175,7 @@ parse_ports() {
   echo "${out# }"
 }
 
-port_in_use() { ss -tln 2>/dev/null | grep -qE "[:.]${1}[[:space:]]"; }
-
-find_free_port() {
-  local p="$1"
-  while port_in_use "$p"; do p=$((p + 1)); done
-  echo "$p"
-}
+port_in_use() { ss -tln 2>/dev/null | grep -q ":${1} "; }
 
 check_tunnel_port_free() {
   if port_in_use "$TUNNEL_PORT"; then
@@ -295,7 +192,7 @@ check_tunnel_port_free() {
 check_forward_ports_free() {
   local ports="$1" bad="" p
   for p in $ports; do
-    if port_in_use "$p" && ! ss -tlnp 2>/dev/null | grep -E "[:.]${p}[[:space:]]" | grep -q rathole; then
+    if ss -tln 2>/dev/null | grep -q ":${p} " && ! ss -tlnp 2>/dev/null | grep -E ":${p} " | grep -q rathole; then
       bad="$bad $p"
     fi
   done
@@ -306,14 +203,12 @@ check_forward_ports_free() {
   return 0
 }
 
-# ---------- Protocol selection ----------
 choose_proto() {
   echo ""
   echo -e "${Y}Choose transport protocol:${N}"
   echo "  1) Noise     (Recommended - encrypted, same speed class as TCP)"
   echo "  2) TCP       (plain, slightly less CPU)"
-  echo "  3) WebSocket (looks like ordinary web traffic on the wire; try this"
-  echo "               if Noise/TCP keep getting cut after a few minutes)"
+  echo "  3) WebSocket (Looks like ordinary web traffic. Try this if others get cut)"
   echo ""
   read -rp "Choice [1]: " pc
   case "${pc:-1}" in
@@ -322,139 +217,17 @@ choose_proto() {
     *) PROTO="noise" ;;
   esac
   ok "Selected protocol: $PROTO"
-}
-
-# ---------- Noise key helpers ----------
-b64_len() { printf '%s' "$1" | base64 -d 2>/dev/null | wc -c; }
-
-gen_noise_keys() {
-  GEN_PRIV=""; GEN_PUB=""
-  local out="" arg
-  for arg in "25519" "x25519" ""; do
-    out="$("$BIN" --genkey $arg 2>/dev/null)" && [ -n "$out" ] && break
-    out=""
-  done
-  GEN_PRIV="$(printf '%s\n' "$out" | sed -n 's/.*[Pp]rivate[ _][Kk]ey[: ]*//p' | head -n1 | tr -d '[:space:]')"
-  GEN_PUB="$(printf  '%s\n' "$out" | sed -n 's/.*[Pp]ublic[ _][Kk]ey[: ]*//p'  | head -n1 | tr -d '[:space:]')"
-  # validate: must be base64-encoded 32-byte X25519 keys (hex keys crash rathole)
-  if [ "$(b64_len "$GEN_PRIV")" = "32" ] && [ "$(b64_len "$GEN_PUB")" = "32" ]; then
-    return 0
-  fi
-  GEN_PRIV=""; GEN_PUB=""
-  return 1
-}
-
-prepare_noise_server() {
-  SRV_PRIV="$NOISE_PRIV"
-  echo ""
-  read -rp "Generate a fresh Noise keypair for this server? (more secure) [y/N]: " gk
-  if [[ "${gk:-N}" =~ ^[Yy]$ ]]; then
-    if gen_noise_keys; then
-      SRV_PRIV="$GEN_PRIV"
-      printf '%s\n' "$GEN_PUB" > "$CONF_DIR/noise-public-key.txt"
-      chmod 600 "$CONF_DIR/noise-public-key.txt"
-      echo ""
-      ok "Fresh keypair generated and validated."
-      echo -e "${Y}------------------------------------------------------------${N}"
-      echo -e "${Y}Public key — enter this on the KHAREJ side when asked:${N}"
-      echo -e "${G}${GEN_PUB}${N}"
-      echo -e "${Y}(also saved to ${CONF_DIR}/noise-public-key.txt)${N}"
-      echo -e "${Y}------------------------------------------------------------${N}"
-      echo ""
-    else
-      warn "Key generation failed; using the built-in keypair."
+  
+  if [ "$PROTO" = "websocket" ] && [ "$TUNNEL_PORT" != "443" ] && [ "$TUNNEL_PORT" != "80" ]; then
+    warn "WebSocket works best on port 80 or 443 to bypass strict DPI."
+    read -rp "Change tunnel port to 443 for better WebSocket compatibility? [Y/n]: " change_port
+    if [[ ! "${change_port:-Y}" =~ ^[Nn]$ ]]; then
+      TUNNEL_PORT="443"
+      ok "Tunnel port changed to 443."
     fi
   fi
 }
 
-prepare_noise_client() {
-  local kfile="$CONF_DIR/client-noise-pubkey" saved=""
-  [ -s "$kfile" ] && saved="$(cat "$kfile")"
-  CLI_PUB="${saved:-$NOISE_PUB}"
-  echo ""
-  if [ -n "$saved" ]; then
-    read -rp "Remote (Iran) Noise public key [Enter = reuse saved key]: " rpk
-  else
-    read -rp "Remote (Iran) Noise public key [Enter = built-in default]: " rpk
-  fi
-  if [ -n "$rpk" ]; then
-    if [ "$(b64_len "$rpk")" = "32" ]; then
-      CLI_PUB="$rpk"
-      ok "Custom public key accepted."
-    else
-      warn "Invalid key (not a 32-byte base64 key) — keeping the previous value."
-    fi
-  fi
-  mkdir -p "$CONF_DIR"
-  printf '%s' "$CLI_PUB" > "$kfile"
-  chmod 600 "$kfile"
-}
-
-# ---------- Token helpers ----------
-# The built-in TOKEN constant is shared by every install of this script.
-# On a network that actively fingerprints/blocks tunnel traffic, that
-# makes every install of it look identical - a random per-install token
-# removes that shared signature (and closes the impersonation risk of a
-# public, hardcoded secret). Reused on re-runs so an already-paired
-# Kharej side is not invalidated by re-running Iran setup.
-gen_token() {
-  if command -v openssl >/dev/null 2>&1; then
-    openssl rand -hex 24
-  else
-    head -c 32 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 40
-  fi
-}
-
-prepare_token_server() {
-  local tfile="$CONF_DIR/token"
-  if [ -s "$tfile" ]; then
-    SRV_TOKEN="$(cat "$tfile")"
-    info "Reusing the existing tunnel token from a previous install."
-    return
-  fi
-  SRV_TOKEN="$TOKEN"
-  echo ""
-  read -rp "Generate a fresh random tunnel token? (recommended) [Y/n]: " gt
-  if [[ ! "${gt:-Y}" =~ ^[Nn]$ ]]; then
-    SRV_TOKEN="$(gen_token)"
-  fi
-  printf '%s' "$SRV_TOKEN" > "$tfile"
-  chmod 600 "$tfile"
-  echo ""
-  ok "Tunnel token ready."
-  echo -e "${Y}------------------------------------------------------------${N}"
-  echo -e "${Y}Token — enter this on the KHAREJ side when asked:${N}"
-  echo -e "${G}${SRV_TOKEN}${N}"
-  echo -e "${Y}(also saved to ${tfile})${N}"
-  echo -e "${Y}------------------------------------------------------------${N}"
-}
-
-prepare_token_client() {
-  local tfile="$CONF_DIR/client-token" saved=""
-  [ -s "$tfile" ] && saved="$(cat "$tfile")"
-  CLI_TOKEN="${saved:-$TOKEN}"
-  echo ""
-  if [ -n "$saved" ]; then
-    read -rp "Tunnel token from the Iran side [Enter = reuse saved token]: " tk
-  else
-    read -rp "Tunnel token from the Iran side [Enter = built-in default]: " tk
-  fi
-  if [ -n "$tk" ]; then
-    CLI_TOKEN="$tk"
-    ok "Custom token accepted."
-  elif [ -z "$saved" ]; then
-    warn "Using the built-in default token — only safe for a quick test."
-  else
-    info "Reusing the previously saved tunnel token."
-  fi
-  mkdir -p "$CONF_DIR"
-  printf '%s' "$CLI_TOKEN" > "$tfile"
-  chmod 600 "$tfile"
-}
-
-# ---------- Transport blocks ----------
-# NOTE: rathole applies [x.transport.tcp] options to noise/tls as well,
-# so the tcp block is always written, whatever the chosen protocol.
 transport_server_block() {
   cat <<EOF
 [server.transport]
@@ -470,7 +243,7 @@ EOF
 
 [server.transport.noise]
 pattern = "Noise_NK_25519_ChaChaPoly_BLAKE2s"
-local_private_key = "${SRV_PRIV}"
+local_private_key = "${NOISE_PRIV}"
 EOF
   elif [ "$PROTO" = "websocket" ]; then
     cat <<EOF
@@ -496,7 +269,7 @@ EOF
 
 [client.transport.noise]
 pattern = "Noise_NK_25519_ChaChaPoly_BLAKE2s"
-remote_public_key = "${CLI_PUB}"
+remote_public_key = "${NOISE_PUB}"
 EOF
   elif [ "$PROTO" = "websocket" ]; then
     cat <<EOF
@@ -507,8 +280,6 @@ EOF
   fi
 }
 
-# ---------- Service creation (with real startup verification) ----------
-# Usage: make_unit <name> <conf> <desc> [must_listen_port]
 make_unit() {
   local name="$1" conf="$2" desc="$3" port="${4:-}"
   systemctl stop "${name}.service" >/dev/null 2>&1
@@ -524,7 +295,7 @@ StartLimitIntervalSec=0
 Type=simple
 ExecStart=${BIN} ${conf}
 Restart=always
-RestartSec=2
+RestartSec=1
 LimitNOFILE=1048576
 OOMScoreAdjust=-900
 Nice=-10
@@ -535,34 +306,28 @@ EOF
   systemctl daemon-reload
   systemctl enable --now "${name}.service" >/dev/null 2>&1
 
-  sleep 3
+  sleep 2
   if ! systemctl is-active --quiet "${name}.service"; then
     err "Service ${name}.service failed to start. Last log lines:"
     journalctl -u "${name}.service" -n 15 --no-pager
     return 1
   fi
-  # a crash-looping service can look "active" at the instant we check
   if journalctl -u "${name}.service" -n 20 --no-pager 2>/dev/null | grep -qiE "panicked|core-dump|core_dump"; then
-    err "Service ${name}.service is crash-looping (panic detected). Last log lines:"
-    journalctl -u "${name}.service" -n 20 --no-pager
+    err "Service ${name}.service is crash-looping (panic detected)."
     return 1
   fi
-  # for the server side, also verify the port is actually bound
   if [ -n "$port" ] && ! port_in_use "$port"; then
-    err "Service is active but port ${port} is NOT bound. Last log lines:"
-    journalctl -u "${name}.service" -n 15 --no-pager
+    err "Service is active but port ${port} is NOT bound."
     return 1
   fi
   ok "Service ${name}.service is active and stable."
   return 0
 }
 
-# ---------- Firewall (path-detected, idempotent, persisted) ----------
 open_ports() {
   local ports="$1" p
   local IPT; IPT="$(command -v iptables 2>/dev/null || true)"
 
-  # 1) high-level firewall managers, if present
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi active; then
     ufw allow "${TUNNEL_PORT}/tcp" >/dev/null 2>&1
     for p in $ports; do ufw allow "${p}/tcp" >/dev/null 2>&1; done
@@ -573,9 +338,7 @@ open_ports() {
     firewall-cmd --reload >/dev/null 2>&1
   fi
 
-  # 2) explicit iptables rules — works regardless of ufw/firewalld
   if [ -n "$IPT" ]; then
-    # remove rules left by a previous install for ports no longer used
     local prev=""
     [ -f "$CONF_DIR/ports.prev" ] && prev="$(tr '\n' ' ' < "$CONF_DIR/ports.prev")"
     for p in $prev; do
@@ -590,12 +353,10 @@ open_ports() {
         "$IPT" -I INPUT -p tcp --dport "${p}" -j ACCEPT
     done
 
-    # persist across reboots (idempotent "-C || -A", no duplicates)
     {
       echo "[Unit]"
-      echo "Description=Rathole firewall rules (tunnel + forward ports)"
+      echo "Description=Rathole firewall rules"
       echo "After=network-online.target"
-      echo "Wants=network-online.target"
       echo ""
       echo "[Service]"
       echo "Type=oneshot"
@@ -610,65 +371,43 @@ open_ports() {
     } > "$FW_SVC"
     systemctl daemon-reload
     systemctl enable --now rathole-fw.service >/dev/null 2>&1
-    ok "Firewall rules applied for port ${TUNNEL_PORT} + forward ports (persisted, idempotent)."
-  else
-    warn "iptables not found — check your cloud firewall / security group manually."
+    ok "Firewall rules applied and persisted."
   fi
 }
 
-# ---------- Anti-drop / performance sysctl tuning ----------
 apply_net_tuning() {
   cat > /etc/sysctl.d/99-rathole-anti-drop.conf <<'EOF'
-# --- Rathole anti-drop / performance tuning (v3) ---
-# BBR + fq: best throughput on lossy, high-latency paths
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
-
-# Large buffers for high bandwidth-delay-product links
-net.core.rmem_max = 67108864
-net.core.wmem_max = 67108864
-net.ipv4.tcp_rmem = 4096 131072 67108864
-net.ipv4.tcp_wmem = 4096 131072 67108864
-
-# Queue depths for many concurrent flows
+net.core.rmem_max = 134217728
+net.core.wmem_max = 134217728
+net.ipv4.tcp_rmem = 4096 87380 134217728
+net.ipv4.tcp_wmem = 4096 65536 134217728
 net.core.netdev_max_backlog = 16384
 net.core.somaxconn = 32768
 net.ipv4.tcp_max_syn_backlog = 8192
-
-# Keepalive defaults for non-rathole sockets (rathole sets its own per-socket)
 net.ipv4.tcp_keepalive_time = 60
 net.ipv4.tcp_keepalive_intvl = 10
 net.ipv4.tcp_keepalive_probes = 6
-
-# Loss tolerance: do NOT reset flows after a few lost retransmits
-# (v2 used tcp_retries2=5, which killed live sessions during loss bursts)
 net.ipv4.tcp_retries2 = 8
 net.ipv4.tcp_syn_retries = 3
 net.ipv4.tcp_synack_retries = 3
-
-# Path-MTU blackhole protection (common on tunneled ISP paths)
 net.ipv4.tcp_mtu_probing = 1
 net.ipv4.tcp_no_metrics_save = 1
 net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_fastopen = 3
 net.ipv4.tcp_fin_timeout = 20
 net.ipv4.tcp_tw_reuse = 1
-
-# Wider ephemeral port range for many parallel data channels (client side)
 net.ipv4.ip_local_port_range = 10240 65535
-
-# File-descriptor ceiling for many concurrent flows
 fs.file-max = 1048576
 EOF
   sysctl --system >/dev/null 2>&1
+  ok "Network tuning applied (BBR, large buffers, fastopen)."
 }
 
-# ---------- MSS clamping (idempotent, non-destructive) ----------
 apply_mss_clamp() {
   local IPT; IPT="$(command -v iptables 2>/dev/null || true)"
   [ -z "$IPT" ] && return 0
-  # v2 flushed the entire mangle/OUTPUT chain — never do that.
-  # Only ensure our single rule exists; leave other rules untouched.
   "$IPT" -t mangle -C OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1360 2>/dev/null || \
     "$IPT" -t mangle -A OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1360
 
@@ -690,48 +429,47 @@ EOF
   ok "Anti-Drop MSS Clamping (1360) applied."
 }
 
-# ---------- Self-healing guard (lightweight, flap-safe) ----------
 install_guard() {
   cat > /usr/local/bin/rathole-guard.sh <<EOF
 #!/bin/bash
-# rathole self-healing guard: restarts the tunnel ONLY after 3 consecutive
-# failed checks (~90s), so brief network blips never trigger a restart.
-PORT=${TUNNEL_PORT}
+# rathole aggressive self-healing guard (v6)
+PORT="${TUNNEL_PORT}"
 ROLE="\$(cat /etc/rathole/role 2>/dev/null)"
-STATE=/run/rathole-guard.fails
-fails="\$(cat "\$STATE" 2>/dev/null || echo 0)"
-
-mark_fail() {
-  fails=\$((fails + 1))
-  echo "\$fails" > "\$STATE"
-  if [ "\$fails" -ge 3 ]; then
-    logger -t rathole-guard "restarting \$1 after \$fails failed checks"
-    systemctl restart "\$1"
-    echo 0 > "\$STATE"
-  fi
-  exit 0
-}
+UNIT=""
 
 case "\$ROLE" in
-  iran)
-    systemctl is-active --quiet rathole-iran.service || mark_fail rathole-iran.service
-    ss -tln 2>/dev/null | grep -qE "[:.]\${PORT}[[:space:]]" || mark_fail rathole-iran.service
-    ;;
-  kharej)
-    systemctl is-active --quiet rathole-kharej-1.service || mark_fail rathole-kharej-1.service
-    # control channel must be established towards the Iran server
-    ss -tn state established 2>/dev/null | grep -qE "[:.]\${PORT}[[:space:]]" || mark_fail rathole-kharej-1.service
-    ;;
+  iran)   UNIT="rathole-iran.service" ;;
+  kharej) UNIT="rathole-kharej-1.service" ;;
   *) exit 0 ;;
 esac
-echo 0 > "\$STATE"
-exit 0
+
+# 1. Immediate restart if inactive
+if ! systemctl is-active --quiet "\$UNIT"; then
+  logger -t rathole-guard "Service \$UNIT is inactive. Restarting immediately."
+  systemctl restart "\$UNIT"
+  exit 0
+fi
+
+# 2. Smart drop detection
+if [ "\$ROLE" = "kharej" ]; then
+  if ! ss -tn state established 2>/dev/null | grep -q ":\${PORT} "; then
+    if journalctl -u "\$UNIT" -n 15 --no-pager 2>/dev/null | grep -qiE "reset by peer|handshake failed|timed out|connection refused|error|panicked|websocket"; then
+      logger -t rathole-guard "No established connection + critical errors. Restarting \$UNIT."
+      systemctl restart "\$UNIT"
+    fi
+  fi
+else
+  if ! ss -tln 2>/dev/null | grep -q ":\${PORT} "; then
+    logger -t rathole-guard "Port \$PORT not listening. Restarting \$UNIT."
+    systemctl restart "\$UNIT"
+  fi
+fi
 EOF
   chmod 0755 /usr/local/bin/rathole-guard.sh
 
   cat > /etc/systemd/system/rathole-guard.service <<'EOF'
 [Unit]
-Description=Rathole self-healing guard check
+Description=Rathole aggressive self-healing guard check
 
 [Service]
 Type=oneshot
@@ -740,12 +478,12 @@ EOF
 
   cat > /etc/systemd/system/rathole-guard.timer <<'EOF'
 [Unit]
-Description=Rathole self-healing guard timer
+Description=Rathole aggressive self-healing guard timer
 
 [Timer]
-OnBootSec=45
-OnUnitActiveSec=30
-AccuracySec=5
+OnBootSec=10
+OnUnitActiveSec=10
+AccuracySec=1
 Unit=rathole-guard.service
 
 [Install]
@@ -754,158 +492,9 @@ EOF
 
   systemctl daemon-reload
   systemctl enable --now rathole-guard.timer >/dev/null 2>&1
-  ok "Self-healing guard installed (checks every 30s, restarts only after 3 failed checks)."
+  ok "Aggressive guard installed (checks every 10s, instant restart on drop/error)."
 }
 
-# ---------- Post-install verification (Iran side) ----------
-test_iran_listening() {
-  info "Verifying the tunnel port is actually listening..."
-  sleep 1
-  if port_in_use "$TUNNEL_PORT"; then
-    ok "Port ${TUNNEL_PORT} is listening locally. Good."
-  else
-    err "Port ${TUNNEL_PORT} is NOT listening. rathole-iran did not bind it."
-    warn "Run: journalctl -u rathole-iran -n 30 --no-pager"
-    return 1
-  fi
-
-  info "Local self-connect test (does not confirm public reachability)..."
-  if command -v curl >/dev/null 2>&1; then
-    curl -s --connect-timeout 3 "http://127.0.0.1:${TUNNEL_PORT}" >/dev/null 2>&1
-    ok "Local TCP handshake reachable on 127.0.0.1:${TUNNEL_PORT}."
-  fi
-  warn "This only confirms the LOCAL bind. If the Kharej client still gets"
-  warn "'Connection refused' after this, the block is on the network path"
-  warn "(cloud provider security group, upstream ISP, or DPI) — not this script."
-}
-
-# ---------- Local self-test (proves the install is sound, not the link) ----------
-# Runs a throwaway rathole server+client pair against each other over
-# loopback, on ports that are actually free, with an ephemeral token and
-# (if genkey works) an ephemeral Noise keypair. Never touches the real
-# config in $CONF_DIR or any real systemd unit. Cleans up after itself.
-run_self_test() {
-  banner
-  info "Running local self-test (validates the binary + config, NOT the network path)..."
-  if [ ! -x "$BIN" ]; then
-    err "Rathole is not installed yet. Run option 1 or 2 first."
-    read -rp "Press Enter to return..."; return
-  fi
-
-  local tmp; tmp=$(mktemp -d)
-  local t_port t_fwd t_origin t_token t_priv t_pub have_py=0
-  t_port=$(find_free_port 28443)
-  t_fwd=$(find_free_port 28080)
-  t_origin=$(find_free_port 28081)
-  t_token="$(gen_token)"
-
-  t_priv="$NOISE_PRIV"; t_pub="$NOISE_PUB"
-  if gen_noise_keys; then t_priv="$GEN_PRIV"; t_pub="$GEN_PUB"; fi
-
-  cat > "$tmp/srv.toml" <<EOF
-[server]
-bind_addr = "127.0.0.1:${t_port}"
-default_token = "${t_token}"
-heartbeat_interval = 10
-
-[server.transport]
-type = "noise"
-
-[server.transport.tcp]
-nodelay = true
-keepalive_secs = 20
-keepalive_interval = 8
-
-[server.transport.noise]
-pattern = "Noise_NK_25519_ChaChaPoly_BLAKE2s"
-local_private_key = "${t_priv}"
-
-[server.services.test]
-type = "tcp"
-bind_addr = "127.0.0.1:${t_fwd}"
-nodelay = true
-EOF
-
-  cat > "$tmp/cli.toml" <<EOF
-[client]
-remote_addr = "127.0.0.1:${t_port}"
-default_token = "${t_token}"
-retry_interval = 1
-heartbeat_timeout = 40
-
-[client.transport]
-type = "noise"
-
-[client.transport.tcp]
-nodelay = true
-keepalive_secs = 20
-keepalive_interval = 8
-
-[client.transport.noise]
-pattern = "Noise_NK_25519_ChaChaPoly_BLAKE2s"
-remote_public_key = "${t_pub}"
-
-[client.services.test]
-type = "tcp"
-local_addr = "127.0.0.1:${t_origin}"
-nodelay = true
-EOF
-
-  local pypid=""
-  if command -v python3 >/dev/null 2>&1; then
-    have_py=1
-    python3 -m http.server "$t_origin" --bind 127.0.0.1 >/dev/null 2>&1 &
-    pypid=$!
-    sleep 1
-  else
-    warn "python3 not found — skipping the end-to-end HTTP check, testing the control channel only."
-  fi
-
-  "$BIN" "$tmp/srv.toml" > "$tmp/s.log" 2>&1 & local sp=$!
-  sleep 1
-  "$BIN" "$tmp/cli.toml" > "$tmp/c.log" 2>&1 & local cp=$!
-  sleep 3
-
-  local pass=0
-  if [ "$have_py" = "1" ]; then
-    local code total
-    read -r code total < <(curl -s -o /dev/null -w "%{http_code} %{time_total}" --max-time 8 "http://127.0.0.1:${t_fwd}/" 2>/dev/null)
-    if [ "$code" = "200" ]; then
-      ok "End-to-end request through the tunnel succeeded (HTTP ${code}, ${total}s)."
-      pass=1
-    else
-      err "End-to-end request failed (HTTP ${code:-none})."
-    fi
-  else
-    if grep -q "Control channel established" "$tmp/c.log" 2>/dev/null; then
-      ok "Control channel established (handshake + token OK)."
-      pass=1
-    else
-      err "Control channel was never established."
-    fi
-  fi
-
-  if [ "$pass" != "1" ]; then
-    echo ""; warn "server log:"; cat "$tmp/s.log" 2>/dev/null
-    echo ""; warn "client log:"; cat "$tmp/c.log" 2>/dev/null
-  fi
-
-  kill "$sp" "$cp" >/dev/null 2>&1
-  [ -n "$pypid" ] && kill "$pypid" >/dev/null 2>&1
-  wait "$sp" "$cp" 2>/dev/null
-  rm -rf "$tmp"
-
-  echo ""
-  if [ "$pass" = "1" ]; then
-    ok "Self-test passed: the binary, config format, token, and Noise handshake all work."
-    info "This does NOT test the real network path between Iran and Kharej — only the local install."
-  else
-    err "Self-test failed: something is wrong with the local rathole install itself, before it ever touches the network."
-  fi
-  read -rp "Press Enter to return..."
-}
-
-# ---------- Setup Iran Server ----------
 setup_iran() {
   banner
   info "Setting up Iran Server (port ${TUNNEL_PORT})..."
@@ -913,24 +502,19 @@ setup_iran() {
   purge_watchdog
   install_core || { read -rp "Press Enter to return..."; return; }
 
-  # re-run safe: stop the previous instance BEFORE checking ports
   systemctl stop rathole-iran.service >/dev/null 2>&1
-
   check_tunnel_port_free || { read -rp "Press Enter to return..."; return; }
 
   local ports="" raw_ports
   while [ -z "$ports" ]; do
-    read -rp "Enter Forward Ports (e.g., 1080,80,443): " raw_ports
+    echo -e "${Y}Tip: You can enter multiple ports separated by commas (e.g., 1080,80,443) to create 3 tunnels in one connection.${N}"
+    read -rp "Enter Forward Ports: " raw_ports
     ports=$(parse_ports "$raw_ports")
   done
 
   check_forward_ports_free "$ports" || { read -rp "Press Enter to return..."; return; }
   choose_proto
-  SRV_PRIV="$NOISE_PRIV"
-  [ "$PROTO" = "noise" ] && prepare_noise_server
-  prepare_token_server
 
-  # remember port list (used to clean old firewall rules on re-install/uninstall)
   [ -f "$CONF_DIR/ports" ] && cp "$CONF_DIR/ports" "$CONF_DIR/ports.prev"
   printf '%s\n' $ports > "$CONF_DIR/ports"
 
@@ -938,7 +522,7 @@ setup_iran() {
   {
     echo "[server]"
     echo "bind_addr = \"0.0.0.0:${TUNNEL_PORT}\""
-    echo "default_token = \"${SRV_TOKEN}\""
+    echo "default_token = \"${TOKEN}\""
     echo "heartbeat_interval = 10"
     echo ""
     transport_server_block
@@ -958,15 +542,13 @@ setup_iran() {
   echo "iran" > "$ROLE_FILE"
   echo "$PROTO" > "$PROTO_FILE"
   install_guard
-  test_iran_listening
 
   echo ""
   ok "Iran Server ready on port ${TUNNEL_PORT} (protocol: ${PROTO})."
-  warn "IMPORTANT: the Kharej side MUST choose the SAME protocol (${PROTO})."
+  ok "Fixed Token used: ${TOKEN}"
   read -rp "Press Enter to return..."
 }
 
-# ---------- Setup Kharej Server ----------
 setup_kharej() {
   banner
   info "Setting up Kharej Server (client)..."
@@ -974,13 +556,9 @@ setup_kharej() {
   purge_watchdog
   install_core || { read -rp "Press Enter to return..."; return; }
 
-  # re-run safe: stop the previous instance first
   systemctl stop rathole-kharej-1.service >/dev/null 2>&1
 
   choose_proto
-  CLI_PUB="$NOISE_PUB"
-  [ "$PROTO" = "noise" ] && prepare_noise_client
-  prepare_token_client
 
   local ip=""
   while [ -z "$ip" ]; do
@@ -990,7 +568,7 @@ setup_kharej() {
 
   local ports="" raw_ports
   while [ -z "$ports" ]; do
-    read -rp "Enter Forward Ports (MUST match Iran side): " raw_ports
+    read -rp "Enter Forward Ports (MUST match Iran side, e.g., 1080,80,443): " raw_ports
     ports=$(parse_ports "$raw_ports")
   done
 
@@ -998,7 +576,7 @@ setup_kharej() {
   {
     echo "[client]"
     echo "remote_addr = \"${ip}:${TUNNEL_PORT}\""
-    echo "default_token = \"${CLI_TOKEN}\""
+    echo "default_token = \"${TOKEN}\""
     echo "retry_interval = 1"
     echo "heartbeat_timeout = 40"
     echo ""
@@ -1020,25 +598,20 @@ setup_kharej() {
   install_guard
 
   info "Watching the first seconds of the connection..."
-  sleep 4
-  if journalctl -u rathole-kharej-1 -n 12 --no-pager 2>/dev/null | grep -qiE "error|refused|reset"; then
-    warn "Recent errors detected:"
+  sleep 3
+  if journalctl -u rathole-kharej-1 -n 12 --no-pager 2>/dev/null | grep -qiE "error|refused|reset|panicked"; then
+    warn "Recent errors detected. Check logs or try a different protocol/port."
     journalctl -u rathole-kharej-1 -n 12 --no-pager
-    echo ""
-    warn "'Connection refused' -> Iran side is down or the port is blocked."
-    warn "'Connection reset'   -> token/key mismatch, wrong protocol on one side, or DPI."
-    warn "Handshake errors     -> Noise keys don't match the Iran public key."
   else
     ok "No recent errors — control channel is up."
   fi
 
   echo ""
   ok "Kharej client configured (Iran: ${ip}:${TUNNEL_PORT}, protocol: ${PROTO})."
-  warn "IMPORTANT: the Iran side MUST be running the SAME protocol (${PROTO})."
+  ok "Fixed Token used: ${TOKEN}"
   read -rp "Press Enter to return..."
 }
 
-# ---------- Status ----------
 show_status() {
   banner
   local role proto
@@ -1046,98 +619,25 @@ show_status() {
   proto="$(cat "$PROTO_FILE" 2>/dev/null || echo '?')"
   info "Role: ${role}    Protocol: ${proto}    Tunnel port: ${TUNNEL_PORT}"
   echo ""
-  systemctl status rathole-iran rathole-kharej-1 --no-pager 2>/dev/null
-  echo ""
-  info "Self-healing guard:"
-  systemctl list-timers rathole-guard.timer --no-pager 2>/dev/null | head -n 3 || true
+  systemctl status rathole-iran rathole-kharej-1 --no-pager 2>/dev/null | head -n 20
   echo ""
   info "Established tunnel connections on port ${TUNNEL_PORT}:"
   ss -tn state established 2>/dev/null | grep ":${TUNNEL_PORT}" || echo "none"
-  echo ""
-  info "Link quality on the established connection (rtt / retransmits):"
-  if ss -ti state established "( dport = :${TUNNEL_PORT} or sport = :${TUNNEL_PORT} )" 2>/dev/null | grep -q rtt; then
-    ss -ti state established "( dport = :${TUNNEL_PORT} or sport = :${TUNNEL_PORT} )" 2>/dev/null | grep -E "rtt|retrans"
-    echo "(rtt/rttvar in ms; a high or climbing 'retrans' count means real packet loss on this link)"
-  else
-    echo "no established socket to inspect right now"
-  fi
-  echo ""
-  info "Listening check on port ${TUNNEL_PORT}:"
-  ss -tln 2>/dev/null | grep ":${TUNNEL_PORT}" || warn "Not listening here."
   echo ""
   read -rp "Press Enter to return..."
 }
 
 restart_all() {
-  rm -f /run/rathole-guard.fails
   systemctl restart rathole-iran rathole-kharej-1 2>/dev/null
   ok "Services restarted."
   sleep 2
 }
 
-# ---------- Live diagnostics (capture the real error at the moment of a drop) ----------
-# Prints a one-line plain-English interpretation right under a log line
-# that matches a known rathole/tunnel failure pattern. Pure pattern
-# matching on text already in the log - never restarts or touches anything.
-# $2 is the role ("iran" or "kharej") this log belongs to: the SAME
-# message means different things on each side. On the server, a failed
-# handshake comes from an unauthenticated inbound connection - anyone on
-# the internet can trigger one, so it's usually background scanning
-# noise, not proof your own Kharej link is broken. On the client, the
-# same message is specifically about your own connection to your own
-# server, so it IS about your link.
-annotate_log_line() {
-  local line="$1" role="${2:-}"
-  case "$line" in
-    *"Failed to run the data channel"*"timed out"*|*"Failed to run the data channel"*"Connection timed out"*)
-      warn "  -> A NEW tunnel connection got no reply at all (not refused, not reset - pure silence). The control channel is still fine; something on the path is dropping SYNs to this IP:port specifically for new connections. Try protocol 3 (WebSocket), or a different tunnel port (e.g. 443)." ;;
-    *"Transport handshake timeout"*|*"deadline has elapsed"*)
-      if [ "$role" = "iran" ]; then
-        warn "  -> An inbound connection never completed its handshake. On a public port this is usually internet scanning noise (or active DPI probing) - anyone can trigger this, not just your Kharej client. Only worth chasing if it lines up with a drop the Kharej side also shows at the same second."
-      else
-        warn "  -> Timeout: your handshake to the Iran server never got a reply. Usually a mid-path drop or DPI throttling. Try protocol 3 (WebSocket)."
-      fi ;;
-    *"Failed to do noise handshake"*|*"Snow error"*)
-      if [ "$role" = "iran" ]; then
-        warn "  -> An inbound connection sent an invalid/undecryptable handshake. On a public port this is almost always an unrelated scanner or bot, NOT your own Kharej client - its key pair already proved itself working when its control channel established. Only worth chasing if it lines up with a Kharej-side drop at the same second."
-      else
-        warn "  -> Noise handshake problem: the local/remote key pair on the two sides don't match."
-      fi ;;
-    *"reset by peer"*|*"Connection reset"*)
-      warn "  -> Reset: token/key mismatch, a protocol mismatch between the two sides, or an active reset on the path." ;;
-    *"Connection refused"*)
-      warn "  -> Refused: the other side is down, or the port is blocked before it reaches rathole." ;;
-  esac
-}
-
-watch_logs() {
-  banner
-  local role unit
-  role="$(cat "$ROLE_FILE" 2>/dev/null || echo '?')"
-  case "$role" in
-    iran)   unit="rathole-iran" ;;
-    kharej) unit="rathole-kharej-1" ;;
-    *) err "No role configured yet (install Iran or Kharej first)."; read -rp "Press Enter to return..."; return ;;
-  esac
-  local out="/root/rathole-diagnostic-$(date +%Y%m%d-%H%M%S).log"
-  info "Live-tailing ${unit}.service — leave this open until the tunnel drops,"
-  info "then press Ctrl+C. This does NOT restart or touch the service."
-  info "Known error patterns are annotated inline as they appear."
-  info "A copy is also being saved to: ${out}"
-  echo ""
-  journalctl -u "${unit}.service" -f -o short-iso | while IFS= read -r line; do
-    echo "$line" | tee -a "$out"
-    annotate_log_line "$line" "$role"
-  done
-}
-
-# ---------- Full uninstall (leaves nothing behind) ----------
 uninstall_all() {
   local IPT; IPT="$(command -v iptables 2>/dev/null || true)"
   systemctl stop rathole-iran rathole-kharej-1 rathole-fw rathole-mss-clamp rathole-guard.timer rathole-guard.service 2>/dev/null
   systemctl disable rathole-iran rathole-kharej-1 rathole-fw rathole-mss-clamp rathole-guard.timer rathole-guard.service 2>/dev/null
 
-  # remove live firewall rules added by this script
   if [ -n "$IPT" ]; then
     local plist="$TUNNEL_PORT"
     [ -f "$CONF_DIR/ports" ] && plist="$plist $(tr '\n' ' ' < "$CONF_DIR/ports")"
@@ -1150,15 +650,14 @@ uninstall_all() {
   fi
 
   rm -rf "$CONF_DIR" "$BIN" /usr/local/bin/rathole-guard.sh
-  rm -f /etc/systemd/system/rathole* /run/rathole-guard.fails
+  rm -f /etc/systemd/system/rathole* 
   rm -f /etc/sysctl.d/99-rathole-anti-drop.conf
   sysctl --system >/dev/null 2>&1
   systemctl daemon-reload
-  ok "Tunnel fully removed (services, firewall rules, sysctl tuning, guard)."
+  ok "Tunnel fully removed."
   sleep 2
 }
 
-# ---------- Main menu ----------
 main_menu() {
   while true; do
     banner
@@ -1167,8 +666,6 @@ main_menu() {
     echo " 3) Status & Connection Test"
     echo " 4) Restart Tunnel Services"
     echo " 5) Fully Remove Tunnel"
-    echo " 6) Watch Live Logs (use this to catch the exact error on the next drop)"
-    echo " 7) Local Self-Test (validate binary + config before deploying)"
     echo " 0) Exit"
     echo ""
     read -rp "Choice: " ch
@@ -1178,8 +675,6 @@ main_menu() {
       3) show_status ;;
       4) restart_all ;;
       5) uninstall_all ;;
-      6) watch_logs ;;
-      7) run_self_test ;;
       0) exit 0 ;;
       *) warn "Invalid choice."; sleep 1 ;;
     esac

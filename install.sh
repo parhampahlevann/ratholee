@@ -66,6 +66,30 @@
 #      reset / handshake failed) to diagnose further - this captures it
 #      the next time it happens instead of guessing blind.
 #  ---------------------------------------------------------------------
+#
+#  v5 changes (turns raw diagnostics into actual answers):
+#
+#  17) NEW: "Local Self-Test" menu option. Spins up a throwaway
+#      server+client pair on free local ports (rathole talking to
+#      itself over loopback, plus a tiny local HTTP origin if python3
+#      is available), runs a real handshake + forwarded request, and
+#      reports pass/fail. This catches a broken binary, a bad token/key
+#      pairing, or a malformed config BEFORE you ever touch the real
+#      Iran/Kharej boxes. It only proves the local install is sound -
+#      it cannot and does not simulate real-network loss, latency, or
+#      DPI, since both ends run on the same machine.
+#  18) "Watch Live Logs" now annotates known rathole error lines as
+#      they stream (timeout -> likely DPI/mid-path drop; reset ->
+#      token/key/protocol mismatch or active reset; refused -> other
+#      side down or port blocked; handshake failure -> Noise key
+#      mismatch), instead of leaving you to interpret raw log text
+#      the moment a drop happens.
+#  19) Status screen now prints live TCP-level stats (rtt, rttvar,
+#      retransmits) for the established tunnel socket via `ss -ti`.
+#      This is the actual signal for "connection has latency / is
+#      unstable" - rathole's own logs don't expose it, but the kernel
+#      does.
+#  ---------------------------------------------------------------------
 # =============================================================================
 
 set -u
@@ -98,7 +122,7 @@ info() { echo -e "${C}[*]${N} $1"; }
 banner() {
   clear
   echo -e "${C}=============================================================${N}"
-  echo -e "${G}   Rathole Reverse Tunnel — Stable Anti-Drop Build (v4)${N}"
+  echo -e "${G}   Rathole Reverse Tunnel — Stable Anti-Drop Build (v5)${N}"
   echo -e "${C}      IRAN (Server)  <<==  ${TUNNEL_PORT}  ==>>  KHAREJ (Client)${N}"
   echo -e "${C}=============================================================${N}"
   echo ""
@@ -249,6 +273,12 @@ parse_ports() {
 }
 
 port_in_use() { ss -tln 2>/dev/null | grep -qE "[:.]${1}[[:space:]]"; }
+
+find_free_port() {
+  local p="$1"
+  while port_in_use "$p"; do p=$((p + 1)); done
+  echo "$p"
+}
 
 check_tunnel_port_free() {
   if port_in_use "$TUNNEL_PORT"; then
@@ -729,6 +759,132 @@ test_iran_listening() {
   warn "(cloud provider security group, upstream ISP, or DPI) — not this script."
 }
 
+# ---------- Local self-test (proves the install is sound, not the link) ----------
+# Runs a throwaway rathole server+client pair against each other over
+# loopback, on ports that are actually free, with an ephemeral token and
+# (if genkey works) an ephemeral Noise keypair. Never touches the real
+# config in $CONF_DIR or any real systemd unit. Cleans up after itself.
+run_self_test() {
+  banner
+  info "Running local self-test (validates the binary + config, NOT the network path)..."
+  if [ ! -x "$BIN" ]; then
+    err "Rathole is not installed yet. Run option 1 or 2 first."
+    read -rp "Press Enter to return..."; return
+  fi
+
+  local tmp; tmp=$(mktemp -d)
+  local t_port t_fwd t_origin t_token t_priv t_pub have_py=0
+  t_port=$(find_free_port 28443)
+  t_fwd=$(find_free_port 28080)
+  t_origin=$(find_free_port 28081)
+  t_token="$(gen_token)"
+
+  t_priv="$NOISE_PRIV"; t_pub="$NOISE_PUB"
+  if gen_noise_keys; then t_priv="$GEN_PRIV"; t_pub="$GEN_PUB"; fi
+
+  cat > "$tmp/srv.toml" <<EOF
+[server]
+bind_addr = "127.0.0.1:${t_port}"
+default_token = "${t_token}"
+heartbeat_interval = 10
+
+[server.transport]
+type = "noise"
+
+[server.transport.tcp]
+nodelay = true
+keepalive_secs = 20
+keepalive_interval = 8
+
+[server.transport.noise]
+pattern = "Noise_NK_25519_ChaChaPoly_BLAKE2s"
+local_private_key = "${t_priv}"
+
+[server.services.test]
+type = "tcp"
+bind_addr = "127.0.0.1:${t_fwd}"
+nodelay = true
+EOF
+
+  cat > "$tmp/cli.toml" <<EOF
+[client]
+remote_addr = "127.0.0.1:${t_port}"
+default_token = "${t_token}"
+retry_interval = 1
+heartbeat_timeout = 40
+
+[client.transport]
+type = "noise"
+
+[client.transport.tcp]
+nodelay = true
+keepalive_secs = 20
+keepalive_interval = 8
+
+[client.transport.noise]
+pattern = "Noise_NK_25519_ChaChaPoly_BLAKE2s"
+remote_public_key = "${t_pub}"
+
+[client.services.test]
+type = "tcp"
+local_addr = "127.0.0.1:${t_origin}"
+nodelay = true
+EOF
+
+  local pypid=""
+  if command -v python3 >/dev/null 2>&1; then
+    have_py=1
+    python3 -m http.server "$t_origin" --bind 127.0.0.1 >/dev/null 2>&1 &
+    pypid=$!
+    sleep 1
+  else
+    warn "python3 not found — skipping the end-to-end HTTP check, testing the control channel only."
+  fi
+
+  "$BIN" "$tmp/srv.toml" > "$tmp/s.log" 2>&1 & local sp=$!
+  sleep 1
+  "$BIN" "$tmp/cli.toml" > "$tmp/c.log" 2>&1 & local cp=$!
+  sleep 3
+
+  local pass=0
+  if [ "$have_py" = "1" ]; then
+    local code total
+    read -r code total < <(curl -s -o /dev/null -w "%{http_code} %{time_total}" --max-time 8 "http://127.0.0.1:${t_fwd}/" 2>/dev/null)
+    if [ "$code" = "200" ]; then
+      ok "End-to-end request through the tunnel succeeded (HTTP ${code}, ${total}s)."
+      pass=1
+    else
+      err "End-to-end request failed (HTTP ${code:-none})."
+    fi
+  else
+    if grep -q "Control channel established" "$tmp/c.log" 2>/dev/null; then
+      ok "Control channel established (handshake + token OK)."
+      pass=1
+    else
+      err "Control channel was never established."
+    fi
+  fi
+
+  if [ "$pass" != "1" ]; then
+    echo ""; warn "server log:"; cat "$tmp/s.log" 2>/dev/null
+    echo ""; warn "client log:"; cat "$tmp/c.log" 2>/dev/null
+  fi
+
+  kill "$sp" "$cp" >/dev/null 2>&1
+  [ -n "$pypid" ] && kill "$pypid" >/dev/null 2>&1
+  wait "$sp" "$cp" 2>/dev/null
+  rm -rf "$tmp"
+
+  echo ""
+  if [ "$pass" = "1" ]; then
+    ok "Self-test passed: the binary, config format, token, and Noise handshake all work."
+    info "This does NOT test the real network path between Iran and Kharej — only the local install."
+  else
+    err "Self-test failed: something is wrong with the local rathole install itself, before it ever touches the network."
+  fi
+  read -rp "Press Enter to return..."
+}
+
 # ---------- Setup Iran Server ----------
 setup_iran() {
   banner
@@ -878,6 +1034,14 @@ show_status() {
   info "Established tunnel connections on port ${TUNNEL_PORT}:"
   ss -tn state established 2>/dev/null | grep ":${TUNNEL_PORT}" || echo "none"
   echo ""
+  info "Link quality on the established connection (rtt / retransmits):"
+  if ss -ti state established "( dport = :${TUNNEL_PORT} or sport = :${TUNNEL_PORT} )" 2>/dev/null | grep -q rtt; then
+    ss -ti state established "( dport = :${TUNNEL_PORT} or sport = :${TUNNEL_PORT} )" 2>/dev/null | grep -E "rtt|retrans"
+    echo "(rtt/rttvar in ms; a high or climbing 'retrans' count means real packet loss on this link)"
+  else
+    echo "no established socket to inspect right now"
+  fi
+  echo ""
   info "Listening check on port ${TUNNEL_PORT}:"
   ss -tln 2>/dev/null | grep ":${TUNNEL_PORT}" || warn "Not listening here."
   echo ""
@@ -892,6 +1056,22 @@ restart_all() {
 }
 
 # ---------- Live diagnostics (capture the real error at the moment of a drop) ----------
+# Prints a one-line plain-English interpretation right under a log line
+# that matches a known rathole/tunnel failure pattern. Pure pattern
+# matching on text already in the log - never restarts or touches anything.
+annotate_log_line() {
+  case "$1" in
+    *"timed out"*|*"deadline has elapsed"*)
+      warn "  -> Timeout: a heartbeat or handshake step never got a reply. Usually a mid-path drop or DPI throttling. Try protocol 3 (WebSocket)." ;;
+    *"reset by peer"*|*"Connection reset"*)
+      warn "  -> Reset: token/key mismatch, a protocol mismatch between the two sides, or an active reset on the path." ;;
+    *"Connection refused"*)
+      warn "  -> Refused: the other side is down, or the port is blocked before it reaches rathole." ;;
+    *"Noise"*[Ff]"ail"*|*"handshake"*[Ff]"ail"*)
+      warn "  -> Noise handshake problem: the local/remote key pair on the two sides don't match." ;;
+  esac
+}
+
 watch_logs() {
   banner
   local role unit
@@ -904,9 +1084,13 @@ watch_logs() {
   local out="/root/rathole-diagnostic-$(date +%Y%m%d-%H%M%S).log"
   info "Live-tailing ${unit}.service — leave this open until the tunnel drops,"
   info "then press Ctrl+C. This does NOT restart or touch the service."
+  info "Known error patterns are annotated inline as they appear."
   info "A copy is also being saved to: ${out}"
   echo ""
-  journalctl -u "${unit}.service" -f -o short-iso | tee -a "$out"
+  journalctl -u "${unit}.service" -f -o short-iso | while IFS= read -r line; do
+    echo "$line" | tee -a "$out"
+    annotate_log_line "$line"
+  done
 }
 
 # ---------- Full uninstall (leaves nothing behind) ----------
@@ -946,6 +1130,7 @@ main_menu() {
     echo " 4) Restart Tunnel Services"
     echo " 5) Fully Remove Tunnel"
     echo " 6) Watch Live Logs (use this to catch the exact error on the next drop)"
+    echo " 7) Local Self-Test (validate binary + config before deploying)"
     echo " 0) Exit"
     echo ""
     read -rp "Choice: " ch
@@ -956,6 +1141,7 @@ main_menu() {
       4) restart_all ;;
       5) uninstall_all ;;
       6) watch_logs ;;
+      7) run_self_test ;;
       0) exit 0 ;;
       *) warn "Invalid choice."; sleep 1 ;;
     esac

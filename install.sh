@@ -1061,6 +1061,8 @@ restart_all() {
 # matching on text already in the log - never restarts or touches anything.
 annotate_log_line() {
   case "$1" in
+    *"Failed to run the data channel"*"timed out"*|*"Failed to run the data channel"*"Connection timed out"*)
+      warn "  -> A NEW tunnel connection got no reply at all (not refused, not reset - pure silence). The control channel is still fine; something on the path is dropping SYNs to this IP:port specifically for new connections. Try protocol 3 (WebSocket), or a different tunnel port (e.g. 443)." ;;
     *"timed out"*|*"deadline has elapsed"*)
       warn "  -> Timeout: a heartbeat or handshake step never got a reply. Usually a mid-path drop or DPI throttling. Try protocol 3 (WebSocket)." ;;
     *"reset by peer"*|*"Connection reset"*)

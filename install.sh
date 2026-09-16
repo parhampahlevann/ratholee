@@ -432,8 +432,12 @@ ask_nodelay() {
     local default_letter="n"
     [[ "$default_val" == "true" ]] && default_letter="y"
 
-    echo
-    read -p "[*] Enable TCP_NODELAY? (y/n) [default: $default_letter]: " nd_answer
+    # IMPORTANT: this function's stdout is captured via $(...) by the caller,
+    # so ANY stray echo/printf that isn't the final true/false answer must go
+    # to stderr (>&2), otherwise it gets prepended to the returned value and
+    # corrupts the generated .toml (this caused the "found a newline" error).
+    echo >&2
+    read -p "[*] Enable TCP_NODELAY? (y/n) [default: $default_letter]: " nd_answer >&2
     nd_answer="${nd_answer:-$default_letter}"
 
     if [[ "$nd_answer" == "y" || "$nd_answer" == "Y" ]]; then

@@ -363,36 +363,40 @@ check_port() {
 choose_profile() {
     echo
     colorize cyan "Select a tuning profile:" bold
-    echo -e " 1) ${GREEN}Gaming${NC}   - lowest latency, no heartbeat overhead"
-    echo -e " 2) ${YELLOW}Stable${NC}   - prioritizes uptime over raw speed"
-    echo -e " 3) ${CYAN}Balanced${NC} - good middle ground for general use"
-    echo -e " 4) ${MAGENTA}Speed${NC}    - maximum throughput (bulk downloads)"
+    echo -e " 1) ${GREEN}Gaming${NC}   - minimum latency / jitter, fast response, low queueing"
+    echo -e " 2) ${YELLOW}Stable${NC}   - maximum connection resilience and consistent uptime"
+    echo -e " 3) ${CYAN}Balanced${NC} - balanced latency, stability and throughput"
+    echo -e " 4) ${MAGENTA}Speed${NC}    - maximum sustained throughput and fast bulk transfers"
     echo -e " 5) Custom     - ask heartbeat manually"
     echo
     read -p "Enter your choice [1-5]: " profile_choice
 
     case "$profile_choice" in
         1)
+            # Gaming: prioritize packet delivery latency and fast recovery.
             PROFILE_NAME="gaming"
-            PROFILE_HEARTBEAT=0
+            PROFILE_HEARTBEAT=10
             PROFILE_NODELAY="true"
             PROFILE_RETRY=1
             ;;
         2)
+            # Stable: keep the session actively monitored and favor resilience.
             PROFILE_NAME="stable"
             PROFILE_HEARTBEAT=30
-            PROFILE_NODELAY="false"
+            PROFILE_NODELAY="true"
             PROFILE_RETRY=3
             ;;
         3)
+            # Balanced: practical compromise between latency, stability and throughput.
             PROFILE_NAME="balanced"
             PROFILE_HEARTBEAT=20
             PROFILE_NODELAY="true"
             PROFILE_RETRY=2
             ;;
         4)
+            # Speed: favor sustained throughput while keeping recovery quick.
             PROFILE_NAME="speed"
-            PROFILE_HEARTBEAT=0
+            PROFILE_HEARTBEAT=30
             PROFILE_NODELAY="false"
             PROFILE_RETRY=1
             ;;
@@ -425,6 +429,7 @@ choose_profile() {
     echo
     colorize green "Profile '$PROFILE_NAME' selected (heartbeat=${PROFILE_HEARTBEAT}s, nodelay=${PROFILE_NODELAY}, retry=${PROFILE_RETRY}s)"
 }
+
 
 # Simple y/n prompt for TCP_NODELAY, defaulting to the profile suggestion
 ask_nodelay() {
@@ -617,10 +622,11 @@ iran_server_configuration() {
     echo
 
     # Initialize transport variable
-    local transport=""
+    local transport="tcp"
     while [[ "$transport" != "tcp" && "$transport" != "udp" ]]; do
-        echo -ne "[*] Transport type(tcp/udp): "
+        echo -ne "[*] Transport type (tcp/udp) [Enter = tcp]: "
         read -r transport
+        transport="${transport:-tcp}"
         if [[ "$transport" != "tcp" && "$transport" != "udp" ]]; then
             colorize red "Invalid transport type. Please enter 'tcp' or 'udp'"
         fi
@@ -842,10 +848,11 @@ kharej_server_configuration() {
 
     echo
 
-    local transport=""
+    local transport="tcp"
     while [[ "$transport" != "tcp" && "$transport" != "udp" ]]; do
-        echo -ne "[*] Transport type (tcp/udp): "
+        echo -ne "[*] Transport type (tcp/udp) [Enter = tcp]: "
         read -r transport
+        transport="${transport:-tcp}"
         if [[ "$transport" != "tcp" && "$transport" != "udp" ]]; then
             colorize red "Invalid transport type. Please enter 'tcp' or 'udp'"
         fi
@@ -1167,10 +1174,11 @@ add_new_config(){
 
     echo
 
-    local transport=""
+    local transport="tcp"
     while [[ "$transport" != "tcp" && "$transport" != "udp" ]]; do
-        echo -ne "[*] Transport type(tcp/udp): "
+        echo -ne "[*] Transport type (tcp/udp) [Enter = tcp]: "
         read -r transport
+        transport="${transport:-tcp}"
         if [[ "$transport" != "tcp" && "$transport" != "udp" ]]; then
             colorize red "Invalid transport type. Please enter 'tcp' or 'udp'"
         fi

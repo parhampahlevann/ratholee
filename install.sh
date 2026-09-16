@@ -382,7 +382,7 @@ check_port() {
 choose_profile() {
     echo
     colorize cyan "Select a tuning profile:" bold
-    echo -e " 1) ${GREEN}Gaming${NC}   - lowest ping/latency/jitter, fastest failure detection & reconnect"
+    echo -e " 1) ${GREEN}Gaming${NC}   - TCP_NODELAY on for real per-packet latency, tuned to avoid false disconnects"
     echo -e " 2) ${YELLOW}Stable${NC}   - tolerates network hiccups, avoids false disconnects, prioritizes uptime"
     echo -e " 3) ${CYAN}Balanced${NC} - sensible defaults for general/mixed use"
     echo -e " 4) ${MAGENTA}Speed${NC}    - maximum throughput for bulk transfers/downloads"
@@ -392,15 +392,61 @@ choose_profile() {
 
     case "$profile_choice" in
         1)
-            # Gaming: TCP_NODELAY on (no packet buffering = lowest latency/jitter),
-            # tight keepalive + short heartbeat so a dropped path is caught almost
-            # instantly, and retry_interval=1 for the fastest possible reconnect.
+            # Gaming - rewritten.
+            #
+            # What actually determines "feel" in a real-time game session:
+            #   1. nodelay=true: this is the one setting with a direct, constant
+            #      effect on every packet - it disables Nagle's algorithm so
+            #      each small game packet goes out immediately instead of being
+            #      buffered/coalesced. Rathole's own upstream docs recommend
+            #      this exact setting for latency-sensitive interactive apps.
+            #   2. keepalive_secs/keepalive_interval only matter while the
+            #      connection is fully IDLE (no packets at all) - during an
+            #      active game session data is flowing constantly, so this
+            #      barely gets triggered. There is no benefit to making it
+            #      aggressive here, so it's left at rathole's own sane
+            #      defaults (20s/8s) instead of an artificially tight value.
+            #   3. heartbeat_interval/heartbeat_timeout is an *active* liveness
+            #      check that runs even while data is flowing. Making this too
+            #      tight (e.g. 8s/20s) is a real bug on Iran<->abroad routes,
+            #      which routinely have bursts of loss/latency from routing and
+            #      DPI interference: a single slow heartbeat round-trip during
+            #      such a burst gets misread as a dead link, and the ENTIRE
+            #      tunnel gets torn down and rebuilt mid-game - a hard,
+            #      multi-second disconnect, which is far worse than a brief
+            #      jitter spike. That mistake is fixed here with a longer,
+            #      still-responsive timeout (15s/45s) that survives normal
+            #      transient loss instead of overreacting to it. The external
+            #      watchdog installed by this script already re-checks the
+            #      link every 10s as a second, independent safety net for
+            #      genuinely dead connections.
+            #   4. retry_interval=1 stays aggressive: IF a real drop does
+            #      happen, reconnect as fast as possible.
+            #
+            # Known limitation this profile CANNOT fix (it's not a tuning
+            # problem): if the forwarded service type is "udp" (true for most
+            # real-time games), rathole still carries that UDP traffic inside
+            # its own TCP-based data channel (see rathole's protocol.rs -
+            # DataChannelCmd::StartForwardUdp is framed and written over a
+            # normal ordered/reliable stream). That means a single lost
+            # segment anywhere on the path forces every later game packet in
+            # that stream to wait for retransmission before delivery
+            # ("TCP/UDP-over-TCP head-of-line blocking") - a well-documented
+            # networking effect, not specific to this script. No nodelay/
+            # keepalive/heartbeat value changes that. The most effective
+            # mitigation available here is making sure BBR congestion control
+            # is active on BOTH the Iran and Kharej boxes (menu option 4,
+            # "Optimize network & system limits") - BBR recovers from loss
+            # much faster than the Linux default (cubic), which measurably
+            # shortens the stalls this causes. If lag/rubber-banding persists
+            # after that, the bottleneck is very likely this architectural
+            # one rather than anything left to tune in this profile.
             PROFILE_NAME="gaming"
             PROFILE_NODELAY="true"
-            PROFILE_KEEPALIVE_SECS=8
-            PROFILE_KEEPALIVE_INTERVAL=2
-            PROFILE_HB_INTERVAL=8
-            PROFILE_HB_TIMEOUT=20
+            PROFILE_KEEPALIVE_SECS=20
+            PROFILE_KEEPALIVE_INTERVAL=8
+            PROFILE_HB_INTERVAL=15
+            PROFILE_HB_TIMEOUT=45
             PROFILE_RETRY=1
             ;;
         2)

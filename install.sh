@@ -356,49 +356,89 @@ check_port() {
 
 # ============================================================
 #  Tuning profiles
-#  Sets: PROFILE_HEARTBEAT (seconds, 0 = disabled)
-#        PROFILE_NODELAY   (true/false)
-#        PROFILE_RETRY     (seconds, client retry_interval)
+#  Uses rathole's real transport/session knobs so each profile
+#  actually behaves the way its name promises:
+#    - nodelay             : disables Nagle's algorithm (TCP_NODELAY).
+#                             true  = every packet is sent immediately
+#                                     -> lowest per-packet latency/jitter,
+#                                        slightly less efficient use of
+#                                        bandwidth for tiny packets.
+#                             false = the kernel is allowed to batch small
+#                                     packets -> higher throughput/efficiency,
+#                                        a bit more latency.
+#    - keepalive_secs/keepalive_interval : OS-level TCP keepalive probing.
+#                             Tighter values notice a dead link faster (and
+#                             let the watchdog react sooner) at the cost of
+#                             a little extra background traffic.
+#    - heartbeat_interval (server) / heartbeat_timeout (client):
+#                             application-level "are you still there" check.
+#                             heartbeat_timeout must stay greater than the
+#                             server's heartbeat_interval (rathole rule).
+#    - retry_interval (client): how fast it re-dials after a drop.
+#  Sets: PROFILE_NAME, PROFILE_NODELAY, PROFILE_KEEPALIVE_SECS,
+#        PROFILE_KEEPALIVE_INTERVAL, PROFILE_HB_INTERVAL, PROFILE_HB_TIMEOUT,
+#        PROFILE_RETRY
 # ============================================================
 choose_profile() {
     echo
     colorize cyan "Select a tuning profile:" bold
-    echo -e " 1) ${GREEN}Gaming${NC}   - minimum latency / jitter, fast response, low queueing"
-    echo -e " 2) ${YELLOW}Stable${NC}   - maximum connection resilience and consistent uptime"
-    echo -e " 3) ${CYAN}Balanced${NC} - balanced latency, stability and throughput"
-    echo -e " 4) ${MAGENTA}Speed${NC}    - maximum sustained throughput and fast bulk transfers"
-    echo -e " 5) Custom     - ask heartbeat manually"
+    echo -e " 1) ${GREEN}Gaming${NC}   - lowest ping/latency/jitter, fastest failure detection & reconnect"
+    echo -e " 2) ${YELLOW}Stable${NC}   - tolerates network hiccups, avoids false disconnects, prioritizes uptime"
+    echo -e " 3) ${CYAN}Balanced${NC} - sensible defaults for general/mixed use"
+    echo -e " 4) ${MAGENTA}Speed${NC}    - maximum throughput for bulk transfers/downloads"
+    echo -e " 5) Custom     - configure heartbeat manually"
     echo
     read -p "Enter your choice [1-5]: " profile_choice
 
     case "$profile_choice" in
         1)
-            # Gaming: prioritize packet delivery latency and fast recovery.
+            # Gaming: TCP_NODELAY on (no packet buffering = lowest latency/jitter),
+            # tight keepalive + short heartbeat so a dropped path is caught almost
+            # instantly, and retry_interval=1 for the fastest possible reconnect.
             PROFILE_NAME="gaming"
-            PROFILE_HEARTBEAT=10
             PROFILE_NODELAY="true"
+            PROFILE_KEEPALIVE_SECS=8
+            PROFILE_KEEPALIVE_INTERVAL=2
+            PROFILE_HB_INTERVAL=8
+            PROFILE_HB_TIMEOUT=20
             PROFILE_RETRY=1
             ;;
         2)
-            # Stable: keep the session actively monitored and favor resilience.
+            # Stable: TCP_NODELAY off (kernel can smooth over small bursts),
+            # loose keepalive/heartbeat so a brief network blip doesn't trigger
+            # an unnecessary reconnect, and a calmer retry pace to avoid
+            # hammering the link during real outages.
             PROFILE_NAME="stable"
-            PROFILE_HEARTBEAT=30
-            PROFILE_NODELAY="true"
+            PROFILE_NODELAY="false"
+            PROFILE_KEEPALIVE_SECS=30
+            PROFILE_KEEPALIVE_INTERVAL=10
+            PROFILE_HB_INTERVAL=30
+            PROFILE_HB_TIMEOUT=90
             PROFILE_RETRY=3
             ;;
         3)
-            # Balanced: practical compromise between latency, stability and throughput.
+            # Balanced: rathole's own upstream defaults (keepalive 20/8) plus a
+            # moderate heartbeat - a safe middle ground for mixed traffic.
             PROFILE_NAME="balanced"
-            PROFILE_HEARTBEAT=20
             PROFILE_NODELAY="true"
+            PROFILE_KEEPALIVE_SECS=20
+            PROFILE_KEEPALIVE_INTERVAL=8
+            PROFILE_HB_INTERVAL=20
+            PROFILE_HB_TIMEOUT=45
             PROFILE_RETRY=2
             ;;
         4)
-            # Speed: favor sustained throughput while keeping recovery quick.
+            # Speed: TCP_NODELAY off so the kernel batches packets into fewer,
+            # larger frames (best for sustained throughput on bulk transfers),
+            # and heartbeat/keepalive kept infrequent to minimize background
+            # overhead competing with the real data.
             PROFILE_NAME="speed"
-            PROFILE_HEARTBEAT=30
             PROFILE_NODELAY="false"
-            PROFILE_RETRY=1
+            PROFILE_KEEPALIVE_SECS=40
+            PROFILE_KEEPALIVE_INTERVAL=12
+            PROFILE_HB_INTERVAL=40
+            PROFILE_HB_TIMEOUT=100
+            PROFILE_RETRY=2
             ;;
         5)
             PROFILE_NAME="custom"
@@ -409,27 +449,34 @@ choose_profile() {
             done
             if [[ "$hb" == "true" ]]; then
                 echo -ne "[*] Heartbeat interval seconds (e.g. 30): "
-                read -r PROFILE_HEARTBEAT
-                [[ "$PROFILE_HEARTBEAT" =~ ^[0-9]+$ ]] || PROFILE_HEARTBEAT=30
+                read -r PROFILE_HB_INTERVAL
+                [[ "$PROFILE_HB_INTERVAL" =~ ^[0-9]+$ ]] || PROFILE_HB_INTERVAL=30
+                # heartbeat_timeout must be greater than heartbeat_interval
+                PROFILE_HB_TIMEOUT=$(( PROFILE_HB_INTERVAL * 3 ))
             else
-                PROFILE_HEARTBEAT=0
+                PROFILE_HB_INTERVAL=0
+                PROFILE_HB_TIMEOUT=0
             fi
             PROFILE_NODELAY="false"
+            PROFILE_KEEPALIVE_SECS=20
+            PROFILE_KEEPALIVE_INTERVAL=8
             PROFILE_RETRY=2
             ;;
         *)
             colorize red "Invalid choice, defaulting to 'balanced'."
             PROFILE_NAME="balanced"
-            PROFILE_HEARTBEAT=20
             PROFILE_NODELAY="true"
+            PROFILE_KEEPALIVE_SECS=20
+            PROFILE_KEEPALIVE_INTERVAL=8
+            PROFILE_HB_INTERVAL=20
+            PROFILE_HB_TIMEOUT=45
             PROFILE_RETRY=2
             ;;
     esac
 
     echo
-    colorize green "Profile '$PROFILE_NAME' selected (heartbeat=${PROFILE_HEARTBEAT}s, nodelay=${PROFILE_NODELAY}, retry=${PROFILE_RETRY}s)"
+    colorize green "Profile '$PROFILE_NAME' selected (nodelay=${PROFILE_NODELAY}, keepalive=${PROFILE_KEEPALIVE_SECS}s/${PROFILE_KEEPALIVE_INTERVAL}s, heartbeat=${PROFILE_HB_INTERVAL}s, retry=${PROFILE_RETRY}s)"
 }
-
 
 # Simple y/n prompt for TCP_NODELAY, defaulting to the profile suggestion
 ask_nodelay() {
@@ -614,15 +661,17 @@ iran_server_configuration() {
         fi
     done
 
-    # Tuning profile decides heartbeat + suggested nodelay
+    # Tuning profile decides heartbeat/keepalive + suggested nodelay
     choose_profile
-    HEARTBEAT="$PROFILE_HEARTBEAT"
+    HB_INTERVAL="$PROFILE_HB_INTERVAL"
+    KEEPALIVE_SECS="$PROFILE_KEEPALIVE_SECS"
+    KEEPALIVE_INTERVAL="$PROFILE_KEEPALIVE_INTERVAL"
     nodelay=$(ask_nodelay "$PROFILE_NODELAY")
 
     echo
 
-    # Initialize transport variable
-    local transport="tcp"
+    # Initialize transport variable (Enter = tcp, but still asks each time)
+    local transport=""
     while [[ "$transport" != "tcp" && "$transport" != "udp" ]]; do
         echo -ne "[*] Transport type (tcp/udp) [Enter = tcp]: "
         read -r transport
@@ -670,13 +719,15 @@ iran_server_configuration() {
 [server]
 bind_addr = "${local_ip}:${tunnel_port}"
 default_token = "$token"
-heartbeat_interval = $HEARTBEAT
+heartbeat_interval = $HB_INTERVAL
 
 [server.transport]
 type = "tcp"
 
 [server.transport.tcp]
 nodelay = $nodelay
+keepalive_secs = $KEEPALIVE_SECS
+keepalive_interval = $KEEPALIVE_INTERVAL
 
 EOF
 
@@ -722,17 +773,20 @@ EOF
 }
 
 # Build ONE kharej client config+service+watchdog for a single Iran server
-# Args: server_ip, tunnel_port, token, transport, nodelay, heartbeat, retry, local_ip, config_ports[]
+# Args: server_ip, tunnel_port, token, transport, nodelay, hb_timeout, retry,
+#       keepalive_secs, keepalive_interval, local_ip, config_ports[]
 build_kharej_profile() {
     local server_addr="$1"
     local tunnel_port="$2"
     local token="$3"
     local transport="$4"
     local nodelay="$5"
-    local heartbeat="$6"
+    local hb_timeout="$6"
     local retry="$7"
-    local local_ip="$8"
-    shift 8
+    local keepalive_secs="$8"
+    local keepalive_interval="$9"
+    local local_ip="${10}"
+    shift 10
     local config_ports=("$@")
 
     # slug used in filenames: sanitize IPv6 colons/brackets
@@ -751,7 +805,7 @@ build_kharej_profile() {
 [client]
 remote_addr = "${server_addr}:${tunnel_port}"
 default_token = "$token"
-heartbeat_timeout = $heartbeat
+heartbeat_timeout = $hb_timeout
 retry_interval = $retry
 
 [client.transport]
@@ -759,6 +813,8 @@ type = "tcp"
 
 [client.transport.tcp]
 nodelay = $nodelay
+keepalive_secs = $keepalive_secs
+keepalive_interval = $keepalive_interval
 
 EOF
 
@@ -842,13 +898,15 @@ kharej_server_configuration() {
     echo
 
     choose_profile
-    HEARTBEAT="$PROFILE_HEARTBEAT"
+    HB_TIMEOUT="$PROFILE_HB_TIMEOUT"
     RETRY="$PROFILE_RETRY"
+    KEEPALIVE_SECS="$PROFILE_KEEPALIVE_SECS"
+    KEEPALIVE_INTERVAL="$PROFILE_KEEPALIVE_INTERVAL"
     nodelay=$(ask_nodelay "$PROFILE_NODELAY")
 
     echo
 
-    local transport="tcp"
+    local transport=""
     while [[ "$transport" != "tcp" && "$transport" != "udp" ]]; do
         echo -ne "[*] Transport type (tcp/udp) [Enter = tcp]: "
         read -r transport
@@ -894,7 +952,7 @@ kharej_server_configuration() {
     echo
 
     for addr in "${server_addrs[@]}"; do
-        build_kharej_profile "$addr" "$tunnel_port" "$token" "$transport" "$nodelay" "$HEARTBEAT" "$RETRY" "0.0.0.0" "${config_ports[@]}"
+        build_kharej_profile "$addr" "$tunnel_port" "$token" "$transport" "$nodelay" "$HB_TIMEOUT" "$RETRY" "$KEEPALIVE_SECS" "$KEEPALIVE_INTERVAL" "0.0.0.0" "${config_ports[@]}"
     done
 
     echo
@@ -1174,7 +1232,7 @@ add_new_config(){
 
     echo
 
-    local transport="tcp"
+    local transport=""
     while [[ "$transport" != "tcp" && "$transport" != "udp" ]]; do
         echo -ne "[*] Transport type (tcp/udp) [Enter = tcp]: "
         read -r transport
